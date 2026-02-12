@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tauroi Prediction Engine — Docker Compose
+# ─────────────────────────────────────────────────────────────────────────────
+#  Usage:
+#    docker compose up              # single run
+#    docker compose up tauroi-loop  # continuous 15-min loop
+#
+#  Secrets are read from .env (never baked into the image).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # Single execution (for cron / GitHub Actions / manual)
+  tauroi:
+    build: .
+    env_file: .env
+    volumes:
+      - ./signals:/app/signals      # persist signal logs to host
+
+  # Continuous loop (for a dedicated server / VM)
+  tauroi-loop:
+    build: .
+    env_file: .env
+    command: ["python", "main.py", "--loop", "--interval", "900"]
+    restart: unless-stopped
+    volumes:
+      - ./signals:/app/signals      # persist signal logs to host

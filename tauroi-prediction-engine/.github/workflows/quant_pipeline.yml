@@ -1,0 +1,108 @@
+###############################################################################
+#  Tauroi Technologies — Quant Pipeline (Production)
+#
+#  This workflow IS the live trading signal engine. It runs on a schedule,
+#  fetches real-time data from Chartmetric + Kalshi, computes the model
+#  fair value, and persists the signal to signals/signal_log.jsonl.
+#
+#  Triggers:
+#    - Cron: every 15 minutes (live market monitoring)
+#    - Push to main/dev (CI: tests + signal generation)
+#    - Manual dispatch (on-demand signal check)
+#
+#  Secrets required (set in GitHub → Settings → Secrets → Actions):
+#    - KALSHI_ACCESS_KEY
+#    - KALSHI_API_SECRET
+#    - CHARTMETRIC_REFRESH_TOKEN
+#    - CHARTMETRIC_ARTIST_ID       (optional, defaults to 214945)
+###############################################################################
+
+name: Quant Pipeline
+
+on:
+  push:
+    branches: ["main", "dev"]
+  schedule:
+    - cron: "*/15 * * * *"       # every 15 minutes
+  workflow_dispatch:              # allow manual runs from the Actions tab
+
+# Prevent concurrent runs from overlapping
+concurrency:
+  group: quant-pipeline
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  JOB 1: Unit Tests (fast gate — blocks signal generation if broken)
+  # ═══════════════════════════════════════════════════════════════════════════
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -v --tb=short
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  JOB 2: Live Signal Generation (runs after tests pass)
+  # ═══════════════════════════════════════════════════════════════════════════
+  signal:
+    needs: test
+    runs-on: ubuntu-latest
+
+    # Only run the live engine if secrets are configured
+    # (forks / PRs won't have them)
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run live signal engine
+        env:
+          KALSHI_ACCESS_KEY: ${{ secrets.KALSHI_ACCESS_KEY }}
+          KALSHI_API_SECRET: ${{ secrets.KALSHI_API_SECRET }}
+          CHARTMETRIC_REFRESH_TOKEN: ${{ secrets.CHARTMETRIC_REFRESH_TOKEN }}
+          CHARTMETRIC_ARTIST_ID: ${{ secrets.CHARTMETRIC_ARTIST_ID || '214945' }}
+        run: python main.py --dry-run
+
+      - name: Upload signal log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-log-${{ github.run_id }}
+          path: signals/signal_log.jsonl
+          retention-days: 90
+
+      - name: Commit signal log to repo
+        if: success()
+        run: |
+          git config user.name "Tauroi Bot"
+          git config user.email "bot@tauroi.dev"
+          git add signals/signal_log.jsonl
+          # Only commit if there are changes
+          git diff --cached --quiet || \
+            git commit -m "signal: $(date -u '+%Y-%m-%d %H:%M UTC')" && \
+            git push

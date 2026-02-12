@@ -1,0 +1,23 @@
+# ── secrets ──────────────────────────────────────────────────────────────────
+.env
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── data outputs ────────────────────────────────────────────────────────────
+data/processed/
+backtest_results/
+
+# ── IDE / OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+
+# ── signals (track the JSONL log, ignore temp files) ────────────────────────
+# signals/signal_log.jsonl is TRACKED (committed by the pipeline)
+signals/*.tmp
