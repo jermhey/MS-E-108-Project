@@ -2,10 +2,11 @@
 #  Tauroi Prediction Engine — Docker Compose
 # ─────────────────────────────────────────────────────────────────────────────
 #  Usage:
-#    docker compose up              # single run
-#    docker compose up tauroi-loop  # continuous 15-min loop
+#    docker compose up              # single scan run
+#    docker compose up tauroi-loop  # continuous hourly loop
 #
 #  Secrets are read from .env (never baked into the image).
+#  The cache/ volume persists Chartmetric data between runs to avoid rate limits.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -15,12 +16,14 @@ services:
     env_file: .env
     volumes:
       - ./signals:/app/signals      # persist signal logs to host
+      - ./cache:/app/cache          # persist Chartmetric data cache
 
   # Continuous loop (for a dedicated server / VM)
   tauroi-loop:
     build: .
     env_file: .env
-    command: ["python", "main.py", "--loop", "--interval", "900"]
+    command: ["python", "main.py", "--scan", "--loop", "--interval", "3600"]
     restart: unless-stopped
     volumes:
       - ./signals:/app/signals      # persist signal logs to host
+      - ./cache:/app/cache          # persist Chartmetric data cache

@@ -9,12 +9,11 @@ Designed to run as a GitHub Action, Docker container, or standalone cron job.
 
 Modes
 -----
-    python main.py                         # Single run: API + Kalshi + signal
-    python main.py --dry-run               # Single run, no order execution
-    python main.py --data-only             # Fetch + calibrate only (no Kalshi)
+    python main.py                         # Single-artist deep dive (from .env)
+    python main.py --scan                  # Full market scan — price ALL artists
+    python main.py --artist "Taylor Swift" --artist-id 2762  # Override artist
+    python main.py --dry-run               # No order execution
     python main.py --loop --interval 900   # Continuous: re-run every 15 min
-    python main.py --strike 100e6          # Override strike
-    python main.py --competitor-listeners 120e6  # WTA manual override
 
 Signal Persistence
 ------------------
@@ -44,11 +43,14 @@ from src.utils import get_logger, format_signal
 # ── configuration ───────────────────────────────────────────────────────────
 
 EDGE_THRESHOLD = 0.05
-DEFAULT_STRIKE = 100_000_000        # "Will Bad Bunny exceed 100M listeners?"
-ARTIST_NAME = "Bad Bunny"
+DEFAULT_STRIKE = 100_000_000
 SIGNAL_LOG_DIR = pathlib.Path(__file__).resolve().parent / "signals"
 
 logger = get_logger("tauroi.main")
+
+# ARTIST_NAME is set dynamically from .env / CLI at runtime.
+# Modules reference this global; it is updated by main() before any run.
+ARTIST_NAME: str = "Bad Bunny"
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -187,11 +189,13 @@ def load_data_from_api(settings: Settings) -> pd.DataFrame:
     (paginated through yearly windows), plus Album/Single release history
     to compute ``event_impact_score``.
 
+    Falls back to local Parquet cache if the API is rate-limited.
+
     Returns a DataFrame with columns the Calibrator and PricingEngine expect:
         Date, spotify_monthly_listeners, tiktok_sound_posts_change,
         event_impact_score
     """
-    from src.chartmetric_client import ChartmetricClient
+    from src.chartmetric_client import ChartmetricClient, ChartmetricAPIError
 
     logger.info("=" * 64)
     logger.info("DATA SOURCE — Chartmetric API (full history)")
@@ -200,7 +204,31 @@ def load_data_from_api(settings: Settings) -> pd.DataFrame:
     client = ChartmetricClient(settings=settings)
     client.check_connection()
 
-    df = client.get_artist_metrics(since="2019-01-01")
+    try:
+        df = client.get_artist_metrics(since="2019-01-01")
+    except (ChartmetricAPIError, Exception) as exc:
+        # ── Fallback: use local scan cache for the primary artist ────
+        artist_id = settings.chartmetric_artist_id
+        cm_id = int(artist_id) if artist_id and artist_id.isdigit() else None
+
+        if cm_id is not None:
+            cached_df = client._load_stale_cache(cm_id)
+            if cached_df is not None and not cached_df.empty:
+                logger.warning(
+                    "API unavailable (%s) — using CACHED scan data "
+                    "(%d rows) for calibration",
+                    str(exc)[:80], len(cached_df),
+                )
+                # Ensure columns the Calibrator expects
+                if "event_impact_score" not in cached_df.columns:
+                    cached_df["event_impact_score"] = 1.0
+                if "tiktok_sound_posts_change" not in cached_df.columns:
+                    cached_df["tiktok_sound_posts_change"] = 0.0
+                client._last_release_count = 0
+                return cached_df, client
+
+        raise  # No cache available — propagate the original error
+
     return df, client
 
 
@@ -610,6 +638,239 @@ def run_real_strategy(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  FULL MARKET SCAN
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_market_scan(
+    cal: CalibrationResult,
+    market_result: Dict[str, Any],
+    all_artists: list[Dict[str, Any]],
+    dry_run: bool = False,
+) -> list[Dict[str, Any]]:
+    """
+    Price **every** contract in a Winner-Take-All market using
+    **per-artist** data from identical sources.
+
+    Each artist is priced with:
+    - Their own Spotify listeners (spot)
+    - Their own sigma (volatility calibrated from their own 90-day history)
+    - Their own TikTok velocity (normalised per-artist)
+    - Shared gamma/beta from the primary artist (calibration anchor)
+    - Strike = max(all other artists' listeners)
+
+    Parameters
+    ----------
+    cal : CalibrationResult
+        Calibration from the primary artist — provides shared gamma/beta.
+    market_result : dict
+        Kalshi market data.
+    all_artists : list of dict
+        Per-artist enriched data from ``get_all_artists_scan_data()``.
+        Each dict has: name, listeners, change_pct, sigma, norm_velocity,
+        tiktok_velocity, spotify_followers, spotify_popularity, data_points.
+    dry_run : bool
+        If True, signals are informational only.
+    """
+    contract = market_result["target_contract"]
+    close_time = contract.get("close_time", contract.get("expiration_time"))
+    T = compute_time_to_expiry(close_time)
+    event_title = market_result.get("event_title", "Unknown Market")
+
+    # Build a Kalshi price lookup — merge target + competitors
+    kalshi_lookup: Dict[str, Dict[str, Any]] = {}
+
+    target_name = contract.get("yes_sub_title", contract.get("subtitle", ""))
+    if target_name:
+        kalshi_lookup[target_name] = contract
+
+    for c in market_result.get("competitors", []):
+        kalshi_lookup[c["name"]] = c
+
+    pricer = JumpDiffusionPricer()
+    scan_rows: list[Dict[str, Any]] = []
+
+    for artist in all_artists:
+        name = artist["name"]
+        spot = float(artist["listeners"])
+        change_pct = artist.get("change_pct")
+        artist_sigma = float(artist.get("sigma", cal.sigma))
+        norm_velocity = float(artist.get("norm_velocity", 0.0))
+
+        # Strike = max listeners among all OTHER artists
+        others_max = max(
+            (a["listeners"] for a in all_artists if a["name"] != name),
+            default=spot,
+        )
+        effective_strike = float(others_max)
+
+        # Per-artist pricing: their OWN sigma + velocity, shared gamma/beta
+        fair_value = pricer.fair_value_calibrated(
+            spot_official=spot,
+            normalized_velocity=norm_velocity,
+            strike=effective_strike,
+            sigma=artist_sigma,
+            jump_beta=cal.jump_beta,
+            vol_gamma=cal.vol_gamma,
+            event_impact_score=1.0,
+            T=T,
+        )
+
+        # Market price from Kalshi
+        kc = kalshi_lookup.get(name, {})
+        yes_bid = kc.get("yes_bid", 0) or 0
+        yes_ask = kc.get("yes_ask", 0) or 0
+        last = kc.get("last_price", 0) or 0
+
+        if yes_bid and yes_ask:
+            market_price = (yes_bid + yes_ask) / 2.0 / 100.0
+        elif last:
+            market_price = float(last) / 100.0
+        else:
+            market_price = 0.01  # default floor
+
+        edge = fair_value - market_price
+        signal = format_signal(edge, threshold=EDGE_THRESHOLD)
+
+        scan_rows.append({
+            "name": name,
+            "listeners": int(spot),
+            "change_pct": change_pct,
+            "sigma": artist_sigma,
+            "norm_velocity": norm_velocity,
+            "tiktok_velocity": artist.get("tiktok_velocity", 0),
+            "spotify_followers": artist.get("spotify_followers", 0),
+            "spotify_popularity": artist.get("spotify_popularity", 0),
+            "youtube_views": artist.get("youtube_views", 0),
+            "instagram_followers": artist.get("instagram_followers", 0),
+            "deezer_fans": artist.get("deezer_fans", 0),
+            "wikipedia_views": artist.get("wikipedia_views", 0),
+            "playlist_reach": artist.get("playlist_reach", 0),
+            "num_playlists": artist.get("num_playlists", 0),
+            "strike": int(effective_strike),
+            "fair_value": round(fair_value, 4),
+            "market_price": round(market_price, 4),
+            "edge": round(edge, 4),
+            "signal": signal,
+            "kalshi_last": last,
+            "ticker": kc.get("ticker"),
+            "data_points": artist.get("data_points", 0),
+            "history_start": artist.get("history_start"),
+            "history_end": artist.get("history_end"),
+        })
+
+    # Sort by edge descending (best opportunities first)
+    scan_rows.sort(key=lambda r: r["edge"], reverse=True)
+
+    # ── Print the scan table ──────────────────────────────────────────
+    print()
+    print("  " + "=" * 100)
+    print(f"  FULL MARKET SCAN — Per-Artist Calibration")
+    print(f"  {event_title}")
+    print(f"  T = {T * 365:.1f} days to expiry  |  Gamma (shared) = {cal.vol_gamma:.2%}  |  Beta (shared) = {cal.jump_beta:.4f}")
+    print("  " + "=" * 100)
+    print()
+    print(f"  {'Artist':<22s} {'Listeners':>14s} {'7d Chg':>8s}"
+          f" {'Sigma':>8s} {'TikTok':>8s}"
+          f" {'Model':>8s} {'Kalshi':>8s} {'Edge':>8s}  {'Signal':<6s}")
+    print("  " + "-" * 100)
+
+    for row in scan_rows:
+        chg = f"{row['change_pct']:+.1f}%" if row["change_pct"] is not None else "—"
+        sigma_str = f"{row['sigma']:.0%}"
+        vel_str = f"{row['norm_velocity']:.2f}" if row["norm_velocity"] > 0 else "—"
+        fv_pct = f"{row['fair_value']:.1%}"
+        mkt = f"{row['kalshi_last']}c" if row["kalshi_last"] else "—"
+        edge_str = f"{row['edge']:+.1%}"
+        star = " *" if row["signal"] == "BUY" else ""
+        print(
+            f"  {row['name']:<22s} {row['listeners']:>14,d} {chg:>8s}"
+            f" {sigma_str:>8s} {vel_str:>8s}"
+            f" {fv_pct:>8s} {mkt:>8s} {edge_str:>8s}  {row['signal']:<6s}{star}"
+        )
+
+    print("  " + "-" * 100)
+
+    # Highlight the best opportunity
+    buys = [r for r in scan_rows if r["signal"] == "BUY"]
+    if buys:
+        best = buys[0]
+        print()
+        if len(buys) == 1:
+            print(f"  BEST EDGE:  {best['name']} ({best['edge']:+.1%})")
+            print(f"  >>> BUY at {best['kalshi_last']}c — model says {best['fair_value']:.1%}")
+        else:
+            print(f"  ACTIONABLE BUYS ({len(buys)}):")
+            for b in buys:
+                print(
+                    f"    {b['name']:<22s}  edge {b['edge']:+.1%}"
+                    f"  (model {b['fair_value']:.1%} vs {b['kalshi_last']}c)"
+                )
+    else:
+        print()
+        print("  No actionable edges — all contracts fairly priced.")
+
+    print("  " + "=" * 100)
+
+    # ── Data consistency report ───────────────────────────────────────
+    print()
+    print("  DATA CONSISTENCY REPORT (identical sources per artist)")
+    print("  " + "-" * 130)
+    print(
+        f"  {'Artist':<22s} {'Rows':>6s} {'Range':>19s}  {'Sigma':>7s}"
+        f"  {'Followers':>12s} {'Pop':>4s}"
+        f"  {'YouTube':>12s} {'Insta':>12s} {'Deezer':>10s} {'Wikipedia':>10s}"
+    )
+    print("  " + "-" * 130)
+    for row in sorted(scan_rows, key=lambda r: r["listeners"], reverse=True):
+        fol = f"{row.get('spotify_followers', 0):,}" if row.get("spotify_followers") else "—"
+        pop = str(row.get("spotify_popularity", 0)) if row.get("spotify_popularity") else "—"
+        yt = f"{row.get('youtube_views', 0):,}" if row.get("youtube_views") else "—"
+        ig = f"{row.get('instagram_followers', 0):,}" if row.get("instagram_followers") else "—"
+        dz = f"{row.get('deezer_fans', 0):,}" if row.get("deezer_fans") else "—"
+        wiki = f"{row.get('wikipedia_views', 0):,}" if row.get("wikipedia_views") else "—"
+        hist = f"{row.get('history_start', '?')}→{row.get('history_end', '?')}"
+        print(
+            f"  {row['name']:<22s} {row['data_points']:>6d} {hist:>19s}"
+            f"  {row['sigma']:>6.1%}  {fol:>12s} {pop:>4s}"
+            f"  {yt:>12s} {ig:>12s} {dz:>10s} {wiki:>10s}"
+        )
+    print("  " + "-" * 130)
+    print()
+
+    # ── Persist each signal ───────────────────────────────────────────
+    for row in scan_rows:
+        append_signal_log({
+            "mode": "scan",
+            "artist": row["name"],
+            "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
+            "spot_official": row["listeners"],
+            "strike": row["strike"],
+            "market_type": "winner_take_all",
+            "fair_value": row["fair_value"],
+            "market_price": row["market_price"],
+            "edge": row["edge"],
+            "signal": row["signal"],
+            "sigma": round(row["sigma"], 6),
+            "norm_velocity": row["norm_velocity"],
+            "spotify_followers": row.get("spotify_followers", 0),
+            "spotify_popularity": row.get("spotify_popularity", 0),
+            "youtube_views": row.get("youtube_views", 0),
+            "instagram_followers": row.get("instagram_followers", 0),
+            "deezer_fans": row.get("deezer_fans", 0),
+            "wikipedia_views": row.get("wikipedia_views", 0),
+            "playlist_reach": row.get("playlist_reach", 0),
+            "data_points": row.get("data_points", 0),
+            "history_start": row.get("history_start"),
+            "history_end": row.get("history_end"),
+            "ticker": row.get("ticker"),
+            "T_days": round(T * 365, 1),
+            "dry_run": dry_run,
+        })
+
+    return scan_rows
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  LIVE DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -661,11 +922,15 @@ def print_live_dashboard(
 def run(
     dry_run: bool = False,
     data_only: bool = False,
+    scan: bool = False,
     strike: float = DEFAULT_STRIKE,
     competitor_listeners: float | None = None,
+    artist_name: str | None = None,
+    artist_id: str | None = None,
+    no_cache: bool = False,
 ) -> None:
     """
-    Full pipeline: fetch API data → calibrate → market → strategy.
+    Full pipeline: fetch API data -> calibrate -> market -> strategy.
 
     Parameters
     ----------
@@ -673,13 +938,42 @@ def run(
         If True, log signals without placing orders.
     data_only : bool
         If True, only fetch data & calibrate (skip Kalshi & strategy).
+    scan : bool
+        If True, discover the market and price EVERY contract (full scan).
     strike : float
         Binary option strike price.
     competitor_listeners : float, optional
         Competitor's listeners (for WTA markets).
+    artist_name : str, optional
+        Override the artist to analyse (defaults to ARTIST_NAME from config).
+    artist_id : str, optional
+        Override the Chartmetric artist ID (defaults to .env).
+    no_cache : bool
+        If True, skip the local Parquet cache and force a full API fetch.
     """
+    global ARTIST_NAME
+
     need_secrets = not data_only
     settings = load_settings(require_secrets=need_secrets)
+
+    # ── Resolve artist identity ──────────────────────────────────────
+    if artist_name:
+        ARTIST_NAME = artist_name
+    else:
+        ARTIST_NAME = settings.artist_name
+
+    effective_artist_id = artist_id or settings.chartmetric_artist_id
+
+    # Patch settings with overrides so the CM client uses the right ID
+    if artist_id:
+        # Build a new Settings with the overridden ID
+        settings = Settings(
+            kalshi_access_key=settings.kalshi_access_key,
+            kalshi_api_secret=settings.kalshi_api_secret,
+            chartmetric_refresh_token=settings.chartmetric_refresh_token,
+            chartmetric_artist_id=effective_artist_id,
+            artist_name=ARTIST_NAME,
+        )
 
     # ── Step 1: Load Data from Chartmetric API ───────────────────────
     df, cm_client = load_data_from_api(settings)
@@ -696,21 +990,119 @@ def run(
         logger.info("--data-only set — skipping Kalshi & strategy.")
         return
 
-    # ── Step 4: Kalshi Market Lookup + Competitor Discovery ──────────
+    # ── Step 4: Kalshi Market Lookup ─────────────────────────────────
     market_result = fetch_kalshi_market(settings)
 
-    # ── Step 5: Competitor Intelligence (auto-fetch real data) ───────
+    if market_result is None:
+        logger.warning("No market found — cannot proceed with strategy.")
+        return
+
+    # ── Step 5: Branch — SCAN or SINGLE-ARTIST ───────────────────────
+    if scan:
+        return _run_scan_pipeline(
+            cm_client, cal, market_result, df, dry_run, no_cache,
+        )
+    else:
+        return _run_single_artist_pipeline(
+            cm_client, cal, market_result, df, strike,
+            competitor_listeners, dry_run,
+        )
+
+
+def _run_scan_pipeline(
+    cm_client: Any,
+    cal: CalibrationResult,
+    market_result: Dict[str, Any],
+    df: pd.DataFrame,
+    dry_run: bool,
+    no_cache: bool = False,
+) -> list[Dict[str, Any]]:
+    """
+    Full market scan with **per-artist consistent data**.
+
+    For every artist in the Kalshi market:
+    1.  Resolve name → Chartmetric ID (via search).
+    2.  Fetch **full history** (since 2019) for Spotify, TikTok,
+        YouTube, Shazam, Instagram, and Deezer.
+    3.  Use local Parquet cache to avoid re-fetching (6h TTL).
+    4.  Compute per-artist sigma from their own listener history.
+    5.  Compute per-artist TikTok velocity.
+    6.  Price using per-artist parameters + shared gamma/beta.
+    """
+    from src.chartmetric_client import DEFAULT_HISTORY_START
+
+    # Collect all artist names from the market
+    contract = market_result["target_contract"]
+    target_name = contract.get("yes_sub_title", contract.get("subtitle", ""))
+    comp_names = [c["name"] for c in market_result.get("competitors", [])]
+
+    # Build a deduplicated list of ALL artist names in the market
+    all_names: list[str] = []
+    if target_name:
+        all_names.append(target_name)
+    for cn in comp_names:
+        if cn not in all_names:
+            all_names.append(cn)
+
+    cache_status = "OFF (--no-cache)" if no_cache else "ON (6h TTL)"
+    logger.info(
+        "SCAN MODE — %d artists × full history (since %s) | cache=%s",
+        len(all_names), DEFAULT_HISTORY_START, cache_status,
+    )
+    print(f"\n  Fetching full-history data for {len(all_names)} artists...")
+    print(f"  Sources: Spotify (listeners/followers/popularity), TikTok, YouTube, Shazam, Instagram, Deezer")
+    print(f"  Cache: {cache_status}")
+    print("  (Identical sources for every artist — no calibration bias)\n")
+
+    # Fetch consistent per-artist data with caching
+    all_artists = cm_client.get_all_artists_scan_data(
+        all_names,
+        since=DEFAULT_HISTORY_START,
+        use_cache=not no_cache,
+    )
+
+    if not all_artists:
+        logger.error("Could not resolve any artists from Chartmetric.")
+        return []
+
+    cached = sum(1 for a in all_artists if a.get("data_points", 0) > 365)
+    print(f"\n  Resolved {len(all_artists)} / {len(all_names)} artists "
+          f"({cached} with deep history)\n")
+
+    # Run the full scan with per-artist parameters
+    scan_results = run_market_scan(
+        cal=cal,
+        market_result=market_result,
+        all_artists=all_artists,
+        dry_run=dry_run,
+    )
+
+    return scan_results
+
+
+def _run_single_artist_pipeline(
+    cm_client: Any,
+    cal: CalibrationResult,
+    market_result: Dict[str, Any],
+    df: pd.DataFrame,
+    strike: float,
+    competitor_listeners: float | None,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """
+    Original single-artist deep dive with full calibration + TikTok signal.
+    """
+    # Competitor intelligence (auto-fetch for WTA markets)
     competitor_data: list[Dict[str, Any]] | None = None
     if (
-        market_result is not None
-        and market_result.get("market_type") == "winner_take_all"
-        and competitor_listeners is None   # don't fetch if manual override
+        market_result.get("market_type") == "winner_take_all"
+        and competitor_listeners is None
     ):
         comp_names = [c["name"] for c in market_result.get("competitors", [])]
         if comp_names:
             competitor_data = cm_client.get_competitors_data(comp_names)
 
-    # ── Step 6: Context-Aware Strategy Engine ────────────────────────
+    # Context-aware strategy engine
     signal_record = run_real_strategy(
         df, cal, market_result, strike,
         competitor_data=competitor_data,
@@ -729,6 +1121,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Tauroi Prediction Engine — Cloud-Ready Production",
     )
+
+    # ── Mode switches ────────────────────────────────────────────────
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        default=False,
+        help="Full market scan — price EVERY contract in the market.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -741,6 +1141,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Only run data loading + calibration (no Kalshi / strategy).",
     )
+
+    # ── Artist overrides ─────────────────────────────────────────────
+    parser.add_argument(
+        "--artist",
+        type=str,
+        default=None,
+        help=(
+            "Artist name for market discovery & display "
+            "(overrides ARTIST_NAME in .env). Example: --artist 'Taylor Swift'"
+        ),
+    )
+    parser.add_argument(
+        "--artist-id",
+        type=str,
+        default=None,
+        help=(
+            "Chartmetric numeric artist ID for full-history calibration "
+            "(overrides CHARTMETRIC_ARTIST_ID in .env). "
+            "Example: --artist-id 2762"
+        ),
+    )
+
+    # ── Pricing overrides ────────────────────────────────────────────
     parser.add_argument(
         "--strike",
         type=float,
@@ -757,6 +1180,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Example: --competitor-listeners 120e6"
         ),
     )
+
+    # ── Cache control ────────────────────────────────────────────────
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Force a full API re-fetch, ignoring the local Parquet cache. "
+            "By default, scan data is cached for 6 hours in cache/."
+        ),
+    )
+
+    # ── Loop / scheduling ────────────────────────────────────────────
     parser.add_argument(
         "--loop",
         action="store_true",
@@ -769,6 +1205,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=900,
         help="Seconds between runs when --loop is set (default: 900 = 15 min).",
     )
+
     return parser.parse_args(argv)
 
 
@@ -781,14 +1218,17 @@ def main(argv: list[str] | None = None) -> None:
             run(
                 dry_run=args.dry_run,
                 data_only=args.data_only,
+                scan=args.scan,
                 strike=args.strike,
                 competitor_listeners=args.competitor_listeners,
+                artist_name=args.artist,
+                artist_id=args.artist_id,
+                no_cache=args.no_cache,
             )
         except KeyboardInterrupt:
             raise
         except Exception:
             logger.error("Pipeline failed:\n%s", traceback.format_exc())
-            # Persist the error to the signal log so it's visible in CI
             append_signal_log({
                 "artist": ARTIST_NAME,
                 "signal": "ERROR",

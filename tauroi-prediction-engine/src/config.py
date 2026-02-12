@@ -46,6 +46,9 @@ class Settings:
     chartmetric_base_url: str = "https://api.chartmetric.com"
     chartmetric_artist_id: str = ""     # Chartmetric numeric artist ID
 
+    # Artist (configurable via .env or CLI override)
+    artist_name: str = "Bad Bunny"
+
     # Paths
     project_root: pathlib.Path = _PROJECT_ROOT
 
@@ -74,6 +77,7 @@ def load_settings(*, require_secrets: bool = True) -> Settings:
         kalshi_api_secret=api_secret,
         chartmetric_refresh_token=os.getenv("CHARTMETRIC_REFRESH_TOKEN", ""),
         chartmetric_artist_id=os.getenv("CHARTMETRIC_ARTIST_ID", ""),
+        artist_name=os.getenv("ARTIST_NAME", "Bad Bunny"),
     )
 
 

@@ -3,7 +3,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  Build:   docker build -t tauroi .
 #  Run:     docker run --env-file .env tauroi
-#  Loop:    docker run --env-file .env tauroi python main.py --loop --interval 900
+#  Scan:    docker run --env-file .env tauroi python main.py --scan --dry-run
+#  Loop:    docker run --env-file .env tauroi python main.py --scan --loop --interval 3600
 # ─────────────────────────────────────────────────────────────────────────────
 
 FROM python:3.11-slim
@@ -20,11 +21,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ src/
+COPY tests/ tests/
 COPY main.py .
 COPY run_backtest.py .
 
-# Create the signal log directory
-RUN mkdir -p signals
+# Create persistent directories
+RUN mkdir -p signals cache
 
-# Default: single run (GitHub Actions / cron compatible)
-CMD ["python", "main.py"]
+# Default: full market scan, single run (GitHub Actions / cron compatible)
+CMD ["python", "main.py", "--scan", "--dry-run"]

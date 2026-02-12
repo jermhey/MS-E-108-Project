@@ -18,6 +18,9 @@ backtest_results/
 .idea/
 .DS_Store
 
+# ── local cache (regenerated from API — never commit) ───────────────────────
+cache/
+
 # ── signals (track the JSONL log, ignore temp files) ────────────────────────
 # signals/signal_log.jsonl is TRACKED (committed by the pipeline)
 signals/*.tmp

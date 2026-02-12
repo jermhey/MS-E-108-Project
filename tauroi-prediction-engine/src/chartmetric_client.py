@@ -30,6 +30,8 @@ Endpoints Used
 from __future__ import annotations
 
 import datetime
+import json
+import pathlib
 import time
 from typing import Any, Dict, List, Optional
 
@@ -49,6 +51,10 @@ _MAX_WINDOW_DAYS = 350  # stay safely under 365
 
 # Default history start date — 6+ years of data for proper vol calibration.
 DEFAULT_HISTORY_START = "2019-01-01"
+
+# ── Local cache ───────────────────────────────────────────────────────────────
+_CACHE_DIR = pathlib.Path(__file__).resolve().parent.parent / "cache"
+_DEFAULT_CACHE_TTL_HOURS = 6
 
 
 class ChartmetricAuthError(Exception):
@@ -83,6 +89,11 @@ class ChartmetricClient:
         self._artist_id = self._settings.chartmetric_artist_id
         self._timeout = timeout
         self._session = requests.Session()
+
+        # Cache state
+        self._cache_dir = _CACHE_DIR
+        self._cache_ttl_hours = _DEFAULT_CACHE_TTL_HOURS
+        self._disabled_scan_sources: set[str] = set()
 
         # Token state
         self._access_token: str = ""
@@ -177,7 +188,19 @@ class ChartmetricClient:
                 continue
 
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "5"))
+                try:
+                    retry_after = int(float(
+                        resp.headers.get("Retry-After", "5"),
+                    ))
+                except (ValueError, TypeError):
+                    retry_after = 60
+
+                if retry_after > 120:
+                    raise ChartmetricAPIError(
+                        f"Rate limited (429) with {retry_after}s backoff — "
+                        f"aborting {method} {path}. Try again later or use cache."
+                    )
+
                 logger.warning("Rate limited (429) — sleeping %ds", retry_after)
                 time.sleep(retry_after)
                 continue
@@ -284,6 +307,7 @@ class ChartmetricClient:
         since: str | None = None,
         until: str | None = None,
         is_domain_id: bool = False,
+        verbose: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Fetch a fan-metric time-series, **automatically paginating**
@@ -307,11 +331,15 @@ class ChartmetricClient:
             End date ``YYYY-MM-DD`` (default: today).
         is_domain_id : bool
             If True, ``artist_id`` is a platform domain ID.
+        verbose : bool
+            If True, log per-window progress at INFO level; else DEBUG.
 
         Returns
         -------
         list of dict
         """
+        _log = logger.info if verbose else logger.debug
+
         today = datetime.date.today()
         if until is None:
             until = today.isoformat()
@@ -341,7 +369,7 @@ class ChartmetricClient:
             )
             window_num += 1
 
-            logger.info(
+            _log(
                 "  [%s] Window %d: %s → %s",
                 source, window_num,
                 window_start.isoformat(), window_end.isoformat(),
@@ -355,20 +383,27 @@ class ChartmetricClient:
                     is_domain_id=is_domain_id,
                 )
                 all_rows.extend(rows)
-                logger.info(
+                _log(
                     "  [%s] Window %d: %d rows", source, window_num, len(rows),
                 )
             except ChartmetricAPIError as exc:
+                exc_str = str(exc)
+                if "Rate limited" in exc_str or "429" in exc_str:
+                    _log(
+                        "  [%s] Rate limited — aborting pagination",
+                        source,
+                    )
+                    break  # Don't waste calls on remaining windows
                 logger.warning(
                     "  [%s] Window %d failed: %s — skipping",
                     source, window_num, exc,
                 )
 
             # Rate-limit courtesy pause between windows
-            time.sleep(1.0)
+            time.sleep(0.5)
             window_start = window_end + datetime.timedelta(days=1)
 
-        logger.info(
+        _log(
             "[%s] Pagination complete — %d total rows across %d windows",
             source, len(all_rows), window_num,
         )
@@ -666,6 +701,614 @@ class ChartmetricClient:
         return results
 
     # ═════════════════════════════════════════════════════════════════════
+    #  Local Parquet Cache
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _cache_path(self, cm_id: int) -> pathlib.Path:
+        """Path to the per-artist Parquet cache file."""
+        return self._cache_dir / f"scan_{cm_id}.parquet"
+
+    def _manifest_path(self) -> pathlib.Path:
+        return self._cache_dir / "_scan_manifest.json"
+
+    def _load_manifest(self) -> Dict[str, Any]:
+        mp = self._manifest_path()
+        if mp.exists():
+            try:
+                return json.loads(mp.read_text())
+            except (json.JSONDecodeError, OSError):
+                return {}
+        return {}
+
+    def _save_manifest(self, manifest: Dict[str, Any]) -> None:
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest_path().write_text(
+            json.dumps(manifest, indent=2, default=str),
+        )
+
+    def _try_load_fresh_cache(
+        self, cm_id: int, name: str,
+    ) -> pd.DataFrame | None:
+        """Return cached DataFrame if it exists AND is within the TTL."""
+        manifest = self._load_manifest()
+        entry = manifest.get(str(cm_id))
+        if not entry:
+            return None
+
+        try:
+            last_updated = datetime.datetime.fromisoformat(
+                entry["last_updated_utc"],
+            )
+        except (ValueError, KeyError):
+            return None
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        age_hours = (now_utc - last_updated).total_seconds() / 3600
+
+        if age_hours > self._cache_ttl_hours:
+            return None  # stale
+
+        cp = self._cache_path(cm_id)
+        if not cp.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(cp)
+            logger.info(
+                "  %s — CACHE HIT (%d rows, %.1fh old, %s → %s)",
+                name, len(df), age_hours,
+                entry.get("since", "?"), entry.get("until", "?"),
+            )
+            return df
+        except Exception as exc:
+            logger.warning("Cache read failed for CM#%d: %s", cm_id, exc)
+            return None
+
+    def _load_stale_cache(self, cm_id: int) -> pd.DataFrame | None:
+        """Load cached DataFrame regardless of freshness (for delta merge)."""
+        cp = self._cache_path(cm_id)
+        if not cp.exists():
+            return None
+        try:
+            return pd.read_parquet(cp)
+        except Exception:
+            return None
+
+    def _save_to_cache(
+        self, cm_id: int, name: str, df: pd.DataFrame,
+    ) -> None:
+        """Persist a merged DataFrame to Parquet and update the manifest."""
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        cp = self._cache_path(cm_id)
+
+        # Ensure all columns are Parquet-compatible
+        save_df = df.copy()
+        for col in save_df.columns:
+            if save_df[col].dtype == object:
+                try:
+                    save_df[col] = pd.to_numeric(save_df[col], errors="coerce")
+                except Exception:
+                    save_df = save_df.drop(columns=[col])
+
+        save_df.to_parquet(cp, index=False)
+
+        manifest = self._load_manifest()
+        manifest[str(cm_id)] = {
+            "name": name,
+            "last_updated_utc": datetime.datetime.now(
+                datetime.timezone.utc,
+            ).isoformat(),
+            "rows": len(df),
+            "since": str(df["Date"].min())[:10] if not df.empty else "?",
+            "until": str(df["Date"].max())[:10] if not df.empty else "?",
+        }
+        self._save_manifest(manifest)
+        logger.debug("  Cached %d rows → %s", len(df), cp.name)
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Market-Wide Scan Data (Consistent Per-Artist, Full History)
+    # ═════════════════════════════════════════════════════════════════════
+
+    # Sources fetched per artist — (api_source, field, column_name, required)
+    # Valid Chartmetric stat sources (from API):
+    #   spotify, deezer, facebook, twitter, instagram, youtube_channel,
+    #   youtube_artist, wikipedia, bandsintown, soundcloud, tiktok,
+    #   twitch, line, melon, bilibili, snap
+    _SCAN_SOURCES: List[tuple] = [
+        ("spotify",          "listeners",   "spotify_monthly_listeners",   True),
+        ("spotify",          "followers",   "spotify_followers",           False),
+        ("spotify",          "popularity",  "spotify_popularity",          False),
+        ("tiktok",           None,          "tiktok_sound_posts_cumulative", False),
+        ("youtube_channel",  None,          "youtube_channel_views",       False),
+        ("instagram",        "followers",   "instagram_followers",         False),
+        ("deezer",           "fans",        "deezer_fans",                 False),
+        ("soundcloud",       None,          "soundcloud_followers",        False),
+        ("wikipedia",        None,          "wikipedia_views",             False),
+    ]
+
+    def get_artist_scan_data(
+        self,
+        cm_id: int,
+        name: str,
+        since: str = DEFAULT_HISTORY_START,
+        use_cache: bool = True,
+    ) -> Dict[str, Any] | None:
+        """
+        Fetch a **full-history, multi-source** data package for one artist.
+
+        With caching enabled (default), data is stored in
+        ``cache/scan_{cm_id}.parquet`` and only delta-fetched when stale.
+
+        Sources fetched (all from Chartmetric ``/stat`` endpoint):
+
+        1. Spotify listeners (primary — **required**)
+        2. Spotify followers
+        3. Spotify popularity
+        4. TikTok sound posts
+        5. YouTube channel views
+        6. Shazam count
+        7. Instagram followers
+        8. Deezer fans
+
+        Returns
+        -------
+        dict or None
+            Enriched artist dict with per-artist sigma, velocity, and
+            latest values for every source.
+        """
+        artist_id = str(cm_id)
+        today = datetime.date.today()
+        until = today.isoformat()
+
+        # ── 1. Cache check (fresh → return immediately) ──────────────
+        if use_cache:
+            fresh_df = self._try_load_fresh_cache(cm_id, name)
+            if fresh_df is not None:
+                return self._build_scan_result(fresh_df, cm_id, name)
+
+        # ── 2. Determine fetch range ─────────────────────────────────
+        stale_cache = self._load_stale_cache(cm_id) if use_cache else None
+
+        if stale_cache is not None and not stale_cache.empty:
+            # Delta: fetch last 30 days and merge with cached history
+            fetch_since = (today - datetime.timedelta(days=30)).isoformat()
+            logger.info(
+                "  %s — cache stale → delta %s → %s",
+                name, fetch_since, until,
+            )
+        else:
+            fetch_since = since
+            stale_cache = None
+
+        # ── 3. Fetch every source ────────────────────────────────────
+        source_dfs: Dict[str, pd.DataFrame] = {}
+
+        for source, field, col_name, required in self._SCAN_SOURCES:
+            source_key = f"{source}/{field or 'default'}"
+
+            # Skip sources disabled earlier in this session
+            if source_key in self._disabled_scan_sources:
+                continue
+
+            try:
+                # Use a single-window probe first for non-required sources
+                # to avoid wasting 8 paginated calls on unavailable sources
+                if not required:
+                    probe_since = (today - datetime.timedelta(days=14)).isoformat()
+                    try:
+                        probe = self._get_artist_stat_window(
+                            artist_id, source, field=field,
+                            since=probe_since, until=until,
+                            is_domain_id=False,
+                        )
+                    except ChartmetricAPIError:
+                        self._disabled_scan_sources.add(source_key)
+                        logger.info(
+                            "  Source %s unavailable — disabled for session",
+                            source_key,
+                        )
+                        continue
+
+                    if not probe:
+                        # Empty but no error — source exists but no data
+                        # Still fetch full range (older data may exist)
+                        pass
+
+                raw = self.get_artist_stat(
+                    artist_id, source, field=field,
+                    since=fetch_since, until=until,
+                    is_domain_id=False, verbose=False,
+                )
+                df = self._parse_timeseries(raw, col_name)
+                if not df.empty:
+                    source_dfs[col_name] = df
+                elif required:
+                    # Retry without field filter for required sources
+                    raw = self.get_artist_stat(
+                        artist_id, source,
+                        since=fetch_since, until=until,
+                        is_domain_id=False, verbose=False,
+                    )
+                    df = self._parse_timeseries(raw, col_name)
+                    if not df.empty:
+                        source_dfs[col_name] = df
+                    else:
+                        logger.warning("  %s — no data for %s", name, col_name)
+                        return None
+            except ChartmetricAPIError as exc:
+                if required:
+                    logger.warning(
+                        "  %s — required source %s failed: %s",
+                        name, source, exc,
+                    )
+                    return None
+                exc_str = str(exc)
+                if any(code in exc_str for code in ("403", "404", "400")):
+                    self._disabled_scan_sources.add(source_key)
+                    logger.info(
+                        "  Source %s unavailable — disabled for session",
+                        source_key,
+                    )
+                else:
+                    logger.debug(
+                        "  %s — %s unavailable: %s",
+                        name, source_key, exc,
+                    )
+
+        if "spotify_monthly_listeners" not in source_dfs:
+            logger.warning("  %s — no Spotify listener data", name)
+            return None
+
+        # ── 4. Merge all sources on Date ─────────────────────────────
+        def _strip_tz(frame: pd.DataFrame) -> pd.DataFrame:
+            if not frame.empty and "Date" in frame.columns:
+                dt_col = pd.to_datetime(frame["Date"])
+                if hasattr(dt_col.dt, "tz") and dt_col.dt.tz is not None:
+                    dt_col = dt_col.dt.tz_localize(None)
+                frame["Date"] = dt_col
+            return frame
+
+        merged = _strip_tz(source_dfs["spotify_monthly_listeners"].copy())
+        for col_name, sdf in source_dfs.items():
+            if col_name == "spotify_monthly_listeners":
+                continue
+            sdf = _strip_tz(sdf.copy())
+            if not sdf.empty:
+                merged = pd.merge(merged, sdf, on="Date", how="left")
+
+        # Ensure all expected columns exist
+        for _, _, col_name, _ in self._SCAN_SOURCES:
+            if col_name not in merged.columns:
+                merged[col_name] = np.nan
+
+        merged = merged.sort_values("Date").reset_index(drop=True)
+
+        # ── 5. Merge with stale cache (delta) ────────────────────────
+        if stale_cache is not None:
+            stale_cache = _strip_tz(stale_cache.copy())
+            for col in merged.columns:
+                if col not in stale_cache.columns:
+                    stale_cache[col] = np.nan
+            old_rows = stale_cache[~stale_cache["Date"].isin(merged["Date"])]
+            merged = pd.concat([old_rows, merged], ignore_index=True)
+            merged = (
+                merged.sort_values("Date")
+                .drop_duplicates(subset=["Date"], keep="last")
+                .reset_index(drop=True)
+            )
+
+        # ── 6. Compute TikTok velocity ───────────────────────────────
+        merged = self._compute_velocity(merged)
+
+        # ── 7. Save to cache ─────────────────────────────────────────
+        if use_cache:
+            self._save_to_cache(cm_id, name, merged)
+
+        return self._build_scan_result(merged, cm_id, name)
+
+    def _build_scan_result(
+        self,
+        merged: pd.DataFrame,
+        cm_id: int,
+        name: str,
+    ) -> Dict[str, Any] | None:
+        """Build the enriched per-artist result dict from a merged DataFrame."""
+        import math
+
+        if merged.empty or "spotify_monthly_listeners" not in merged.columns:
+            return None
+
+        # Recompute velocity if missing (e.g., from cache load)
+        if "tiktok_sound_posts_change" not in merged.columns:
+            merged = self._compute_velocity(merged)
+
+        # ── Per-artist sigma ─────────────────────────────────────────
+        listeners = merged["spotify_monthly_listeners"].astype(float)
+        pct_change = listeners.pct_change().dropna()
+
+        if not pct_change.empty and len(pct_change) >= 5:
+            sigma_sample = float(pct_change.std()) * math.sqrt(365)
+            p_min, p_max = float(listeners.min()), float(listeners.max())
+            n_days = max(len(listeners) - 1, 1)
+            if p_min > 0:
+                range_pct = (p_max - p_min) / p_min
+                sigma_range = (
+                    (range_pct / math.sqrt(n_days)) * math.sqrt(365)
+                )
+            else:
+                sigma_range = 0.0
+            sigma = max(sigma_sample, sigma_range)
+        else:
+            sigma = 0.20  # fallback
+
+        # ── Latest values (from the last row of the merged DF) ───────
+        latest = merged.iloc[-1]
+
+        def _safe_int(val: Any, default: int = 0) -> int:
+            """Convert to int, treating NaN/None as default."""
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                return default
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return default
+
+        def _safe_float(val: Any, default: float = 0.0) -> float:
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+
+        latest_listeners = _safe_int(latest.get("spotify_monthly_listeners"))
+        latest_velocity = _safe_float(latest.get("tiktok_sound_posts_change"))
+        latest_followers = _safe_int(latest.get("spotify_followers"))
+        latest_popularity = _safe_int(latest.get("spotify_popularity"))
+        latest_youtube = _safe_int(latest.get("youtube_channel_views"))
+        latest_instagram = _safe_int(latest.get("instagram_followers"))
+        latest_deezer = _safe_int(latest.get("deezer_fans"))
+        latest_soundcloud = _safe_int(latest.get("soundcloud_followers"))
+        latest_wikipedia = _safe_int(latest.get("wikipedia_views"))
+
+        # TikTok P95 for normalisation
+        tiktok_col = merged["tiktok_sound_posts_change"].clip(lower=0)
+        tiktok_p95 = (
+            float(tiktok_col.quantile(0.95))
+            if not tiktok_col.isna().all()
+            else 0.0
+        )
+        norm_velocity = (
+            min(latest_velocity / tiktok_p95, 1.0)
+            if tiktok_p95 > 0 and latest_velocity > 0
+            else 0.0
+        )
+
+        # 7-day change
+        change_pct = None
+        if len(merged) >= 7:
+            old = float(merged.iloc[-7]["spotify_monthly_listeners"])
+            if old > 0:
+                change_pct = round(
+                    (latest_listeners - old) / old * 100, 2,
+                )
+
+        # Playlist reach (best effort)
+        playlist_data = self.get_artist_playlist_reach(cm_id)
+
+        return {
+            "name": name,
+            "cm_id": cm_id,
+            "df": merged,
+            "listeners": latest_listeners,
+            "change_pct": change_pct,
+            "sigma": round(sigma, 6),
+            "tiktok_velocity": latest_velocity,
+            "tiktok_p95": tiktok_p95,
+            "norm_velocity": round(norm_velocity, 4),
+            "spotify_followers": latest_followers,
+            "spotify_popularity": latest_popularity,
+            "youtube_views": latest_youtube,
+            "instagram_followers": latest_instagram,
+            "deezer_fans": latest_deezer,
+            "soundcloud_followers": latest_soundcloud,
+            "wikipedia_views": latest_wikipedia,
+            "playlist_reach": playlist_data["total_reach"],
+            "num_playlists": playlist_data["num_playlists"],
+            "editorial_reach": playlist_data["editorial_reach"],
+            "data_points": len(merged),
+            "history_start": str(merged["Date"].min())[:10],
+            "history_end": str(merged["Date"].max())[:10],
+        }
+
+    def get_all_artists_scan_data(
+        self,
+        artist_names: List[str],
+        since: str = DEFAULT_HISTORY_START,
+        use_cache: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Resolve and fetch **consistent** multi-source data for every
+        artist in a market, using **full historical data** and local
+        Parquet caching.
+
+        For each artist:
+        1.  Resolve name → Chartmetric numeric ID (via search).
+        2.  Check the local cache — if fresh, return immediately.
+        3.  Otherwise fetch full history (since 2019) across all sources.
+        4.  Compute per-artist sigma and velocity from own data.
+
+        Returns a list sorted by listeners descending.
+        """
+        n_artists = len(artist_names)
+        logger.info("=" * 64)
+        logger.info(
+            "FULL MARKET SCAN DATA — %d artists (since %s, cache=%s)",
+            n_artists, since, "ON" if use_cache else "OFF",
+        )
+        logger.info("=" * 64)
+
+        # Build a reverse lookup from manifest: name → cm_id
+        manifest = self._load_manifest()
+        _name_to_cmid: Dict[str, int] = {}
+        for cmid_str, entry in manifest.items():
+            cached_name = entry.get("name", "")
+            if cached_name:
+                _name_to_cmid[cached_name.lower().strip()] = int(cmid_str)
+
+        results: List[Dict[str, Any]] = []
+
+        for i, name in enumerate(artist_names, 1):
+            # ── Try cached CM ID first (avoids search API when rate-limited)
+            cm_id = _name_to_cmid.get(name.lower().strip())
+            if cm_id is not None:
+                logger.info(
+                    "  [%d/%d] %s → CM#%d (from cache manifest)",
+                    i, n_artists, name, cm_id,
+                )
+            else:
+                cm_id = self.search_artist(name)
+                if cm_id is None:
+                    logger.warning("  Could not resolve '%s' — skipping", name)
+                    continue
+                logger.info(
+                    "  [%d/%d] %s → CM#%d",
+                    i, n_artists, name, cm_id,
+                )
+
+            try:
+                data = self.get_artist_scan_data(
+                    cm_id, name, since=since, use_cache=use_cache,
+                )
+            except ChartmetricAPIError as exc:
+                logger.warning(
+                    "  %s — API error (likely rate limit): %s — skipping",
+                    name, str(exc)[:120],
+                )
+                continue
+
+            if data is None:
+                logger.warning("  %s — no data returned, skipping", name)
+                continue
+
+            results.append(data)
+
+            chg = (
+                f"{data['change_pct']:+.1f}%"
+                if data["change_pct"] is not None
+                else "—"
+            )
+            logger.info(
+                "  %s — %s listeners (%s 7d) | sigma=%.1f%% | %d rows (%s→%s)",
+                name,
+                f"{data['listeners']:,}",
+                chg,
+                data["sigma"] * 100,
+                data["data_points"],
+                data.get("history_start", "?"),
+                data.get("history_end", "?"),
+            )
+
+            time.sleep(0.3)
+
+        results.sort(key=lambda r: r["listeners"], reverse=True)
+
+        logger.info(
+            "Scan data complete: %d/%d artists | cache=%s",
+            len(results), n_artists, "ON" if use_cache else "OFF",
+        )
+        return results
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Spotify Playlist Reach
+    # ═════════════════════════════════════════════════════════════════════
+
+    # Class-level flag: skip playlist calls if the endpoint is unavailable
+    _playlist_endpoint_available: bool = True
+
+    def get_artist_playlist_reach(
+        self,
+        cm_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Fetch the artist's **current** Spotify playlist placements and
+        compute total playlist reach (sum of all playlist follower counts).
+
+        Endpoint: ``GET /api/artist/{id}/playlists/spotify/current``
+
+        If the endpoint returns 401/403 (trial tier), it is disabled for
+        the rest of this session to avoid burning API retries.
+
+        Returns
+        -------
+        dict
+            Keys: ``total_reach`` (int), ``num_playlists`` (int),
+            ``editorial_reach`` (int), ``num_editorial`` (int).
+        """
+        result = {
+            "total_reach": 0,
+            "num_playlists": 0,
+            "editorial_reach": 0,
+            "num_editorial": 0,
+        }
+
+        # Skip if we've already detected the endpoint is unavailable
+        if not self._playlist_endpoint_available:
+            return result
+
+        try:
+            # Use a single-shot request (no retries) to fail fast
+            self._ensure_token()
+            url = f"{self._base_url}/api/artist/{cm_id}/playlists/spotify/current"
+            resp = self._session.get(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Accept": "application/json",
+                },
+                params={
+                    "editorial": "true",
+                    "indie": "true",
+                    "majorCurator": "true",
+                    "limit": 100,
+                    "offset": 0,
+                },
+                timeout=self._timeout,
+            )
+
+            if resp.status_code in (401, 403):
+                logger.info(
+                    "Playlist endpoint unavailable (%d) — disabling for this session",
+                    resp.status_code,
+                )
+                self._playlist_endpoint_available = False
+                return result
+
+            if not resp.ok:
+                return result
+
+            data = resp.json()
+            obj = data.get("obj", data)
+            playlists = obj if isinstance(obj, list) else []
+
+            for pl in playlists:
+                playlist_info = pl.get("playlist", pl) if isinstance(pl, dict) else {}
+                followers = playlist_info.get("followers", 0) or 0
+                is_editorial = playlist_info.get("editorial", False)
+
+                result["total_reach"] += int(followers)
+                result["num_playlists"] += 1
+
+                if is_editorial:
+                    result["editorial_reach"] += int(followers)
+                    result["num_editorial"] += 1
+
+        except Exception as exc:
+            logger.debug("Playlist fetch for CM#%d failed: %s", cm_id, exc)
+
+        return result
+
+    # ═════════════════════════════════════════════════════════════════════
     #  High-Level: Get Full-History Model-Ready Metrics
     # ═════════════════════════════════════════════════════════════════════
 
@@ -811,8 +1454,26 @@ class ChartmetricClient:
     #  Internal Helpers
     # ─────────────────────────────────────────────────────────────────────
 
-    @staticmethod
+    # Mapping from our column names to known Chartmetric response keys.
+    # When the API returns named keys instead of "value", this ensures
+    # we always extract the RIGHT metric — never conflating followers
+    # with listeners, etc.
+    _FIELD_HINTS: Dict[str, List[str]] = {
+        "spotify_monthly_listeners": ["listeners", "monthly_listeners", "value"],
+        "spotify_followers": ["followers", "value"],
+        "spotify_popularity": ["popularity", "value"],
+        "tiktok_sound_posts_cumulative": ["value"],
+        "youtube_channel_views": ["views", "channel_views", "daily_views", "value"],
+        "youtube_channel_subscribers": ["subscribers", "value"],
+        "instagram_followers": ["followers", "value"],
+        "deezer_fans": ["fans", "value"],
+        "soundcloud_followers": ["followers", "value"],
+        "wikipedia_views": ["views", "value"],
+    }
+
+    @classmethod
     def _parse_timeseries(
+        cls,
         raw: List[Dict[str, Any]],
         value_col: str,
     ) -> pd.DataFrame:
@@ -823,9 +1484,16 @@ class ChartmetricClient:
         - ``[{"timestp": "2026-02-10", "value": 123}, ...]``
         - ``[{"timestp": "2026-02-10", "listeners": 123, ...}, ...]``
         - ``[{"date": "2026-02-10", "value": 123}, ...]``
+
+        To avoid conflating different metrics (e.g. followers vs listeners),
+        the method first checks ``_FIELD_HINTS`` for the expected key names
+        before falling back to the first numeric field.
         """
         if not raw:
             return pd.DataFrame(columns=["Date", value_col])
+
+        # Ordered list of keys to look for, specific to this metric
+        hint_keys = cls._FIELD_HINTS.get(value_col, ["value"])
 
         records = []
         for item in raw:
@@ -838,7 +1506,14 @@ class ChartmetricClient:
             if not dt_str:
                 continue
 
-            val = item.get("value")
+            # 1. Try hint keys in priority order (most specific first)
+            val = None
+            for key in hint_keys:
+                if key in item and isinstance(item[key], (int, float)):
+                    val = item[key]
+                    break
+
+            # 2. Last-resort fallback: first numeric field
             if val is None:
                 for k, v in item.items():
                     if k not in ("timestp", "date", "timestamp", "id") and isinstance(v, (int, float)):

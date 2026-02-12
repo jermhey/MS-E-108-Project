@@ -6,7 +6,7 @@
 #  fair value, and persists the signal to signals/signal_log.jsonl.
 #
 #  Triggers:
-#    - Cron: every 15 minutes (live market monitoring)
+#    - Cron: every hour (live market monitoring — respects Chartmetric rate limits)
 #    - Push to main/dev (CI: tests + signal generation)
 #    - Manual dispatch (on-demand signal check)
 #
@@ -15,6 +15,7 @@
 #    - KALSHI_API_SECRET
 #    - CHARTMETRIC_REFRESH_TOKEN
 #    - CHARTMETRIC_ARTIST_ID       (optional, defaults to 214945)
+#    - ARTIST_NAME                 (optional, defaults to "Bad Bunny")
 ###############################################################################
 
 name: Quant Pipeline
@@ -23,7 +24,7 @@ on:
   push:
     branches: ["main", "dev"]
   schedule:
-    - cron: "*/15 * * * *"       # every 15 minutes
+    - cron: "0 * * * *"           # every hour (top of the hour)
   workflow_dispatch:              # allow manual runs from the Actions tab
 
 # Prevent concurrent runs from overlapping
@@ -80,13 +81,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run live signal engine
+      # ── Restore Chartmetric data cache from previous runs ──────────
+      # This avoids re-fetching full history on every run (prevents
+      # rate limiting). The cache key includes the date so it refreshes
+      # daily, ensuring data stays current.
+      - name: Restore Chartmetric data cache
+        uses: actions/cache@v4
+        with:
+          path: cache/
+          key: chartmetric-cache-${{ hashFiles('requirements.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            chartmetric-cache-${{ hashFiles('requirements.txt') }}-
+
+      - name: Run live signal engine (full market scan)
         env:
           KALSHI_ACCESS_KEY: ${{ secrets.KALSHI_ACCESS_KEY }}
           KALSHI_API_SECRET: ${{ secrets.KALSHI_API_SECRET }}
           CHARTMETRIC_REFRESH_TOKEN: ${{ secrets.CHARTMETRIC_REFRESH_TOKEN }}
           CHARTMETRIC_ARTIST_ID: ${{ secrets.CHARTMETRIC_ARTIST_ID || '214945' }}
-        run: python main.py --dry-run
+          ARTIST_NAME: ${{ secrets.ARTIST_NAME || 'Bad Bunny' }}
+        run: python main.py --scan --dry-run
 
       - name: Upload signal log as artifact
         if: always()
