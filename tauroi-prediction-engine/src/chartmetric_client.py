@@ -230,10 +230,26 @@ class ChartmetricClient:
     # ═════════════════════════════════════════════════════════════════════
 
     def check_connection(self) -> bool:
-        """Verify that the refresh token is valid and we can reach the API."""
-        self._refresh_access_token()
-        logger.info("Chartmetric connection verified")
-        return True
+        """
+        Verify that the refresh token is valid and we can reach the API.
+
+        If the token refresh itself is rate-limited (429), log a warning
+        but do NOT crash — the caller (get_artist_metrics) will fall back
+        to the local cache.
+        """
+        try:
+            self._refresh_access_token()
+            logger.info("Chartmetric connection verified")
+            return True
+        except ChartmetricAPIError as exc:
+            err_msg = str(exc).lower()
+            if "429" in err_msg or "rate" in err_msg or "401" in err_msg:
+                logger.warning(
+                    "Chartmetric API rate-limited during auth — "
+                    "will attempt cache fallback for data."
+                )
+                return False
+            raise
 
     # ═════════════════════════════════════════════════════════════════════
     #  Artist ID Handling
@@ -1326,6 +1342,10 @@ class ChartmetricClient:
             Date, spotify_monthly_listeners, tiktok_sound_posts_change,
             event_impact_score
 
+        **Resilience:** If the API returns a 429 (rate limit) or 401,
+        this method falls back to the local Parquet scan cache. Only
+        raises if *both* the API fails AND no cache exists.
+
         Parameters
         ----------
         artist_id : str, optional
@@ -1346,6 +1366,52 @@ class ChartmetricClient:
                 "(from app.chartmetric.com/artist?id=<ID>)."
             )
 
+        # ── Attempt the full API fetch, fall back to cache on 429/401 ─
+        try:
+            return self._fetch_artist_metrics_from_api(artist_id, since)
+        except ChartmetricAPIError as exc:
+            err_msg = str(exc).lower()
+            is_rate_limit = "429" in err_msg or "rate" in err_msg or "401" in err_msg
+            if not is_rate_limit:
+                raise  # non-rate-limit error — propagate immediately
+
+            logger.warning(
+                "API Rate Limited (429/401). Attempting cache fallback..."
+            )
+            cm_id = int(artist_id) if self._is_numeric_id(artist_id) else None
+            if cm_id is not None:
+                cached_df = self._load_stale_cache(cm_id)
+                if cached_df is not None and not cached_df.empty:
+                    # Ensure the columns the Calibrator/PricingEngine expect
+                    if "event_impact_score" not in cached_df.columns:
+                        cached_df["event_impact_score"] = 1.0
+                    if "tiktok_sound_posts_change" not in cached_df.columns:
+                        cached_df["tiktok_sound_posts_change"] = 0.0
+                    self._last_release_count = 0
+                    logger.warning(
+                        "Using committed cache/ file as backup "
+                        "(%d rows, %s -> %s)",
+                        len(cached_df),
+                        cached_df["Date"].min() if "Date" in cached_df.columns else "?",
+                        cached_df["Date"].max() if "Date" in cached_df.columns else "?",
+                    )
+                    return cached_df
+
+            # No cache available either — re-raise the original API error
+            raise ChartmetricAPIError(
+                f"API rate-limited AND no local cache found for artist {artist_id}. "
+                f"Original error: {exc}"
+            ) from exc
+
+    def _fetch_artist_metrics_from_api(
+        self,
+        artist_id: str,
+        since: str = DEFAULT_HISTORY_START,
+    ) -> pd.DataFrame:
+        """
+        Internal: perform the actual API fetch for get_artist_metrics.
+        Separated so the public method can wrap it with cache fallback.
+        """
         use_domain_id = not self._is_numeric_id(artist_id)
         id_label = f"Spotify:{artist_id}" if use_domain_id else f"CM#{artist_id}"
         until = datetime.date.today().isoformat()

@@ -18,8 +18,11 @@ backtest_results/
 .idea/
 .DS_Store
 
-# ── local cache (regenerated from API — never commit) ───────────────────────
-cache/
+# ── local cache ─────────────────────────────────────────────────────────────
+# Cache is COMMITTED to the repo so GitHub Actions runners have fallback data
+# when the Chartmetric API is rate-limited (429). Parquet files are small
+# (~150KB each) and regenerated automatically when the API is available.
+# cache/
 
 # ── signals (track the JSONL log, ignore temp files) ────────────────────────
 # signals/signal_log.jsonl is TRACKED (committed by the pipeline)
