@@ -759,6 +759,29 @@ def run_market_scan(
             "history_end": artist.get("history_end"),
         })
 
+    # ══════════════════════════════════════════════════════════════════
+    #  WTA Probability Normalization
+    # ══════════════════════════════════════════════════════════════════
+    # In a Winner-Take-All market, exactly one artist wins, so the
+    # probabilities MUST sum to 1.0.  The raw model computes each
+    # artist's probability independently (GBM doesn't know about
+    # mutual exclusivity), so we rescale:
+    #     P_normalized(i) = P_raw(i) / Σ P_raw(j)
+    # Then recompute edge and signal from the normalized values.
+    total_fv = sum(r["fair_value"] for r in scan_rows)
+    if total_fv > 0:
+        norm_factor = total_fv
+        logger.info(
+            "Normalizing WTA probabilities: raw sum = %.2f%% → 100%% "
+            "(factor = %.4f)",
+            total_fv * 100, norm_factor,
+        )
+        for r in scan_rows:
+            r["raw_fair_value"] = r["fair_value"]
+            r["fair_value"] = round(r["fair_value"] / norm_factor, 4)
+            r["edge"] = round(r["fair_value"] - r["market_price"], 4)
+            r["signal"] = format_signal(r["edge"], threshold=EDGE_THRESHOLD)
+
     # Sort by edge descending (best opportunities first)
     scan_rows.sort(key=lambda r: r["edge"], reverse=True)
 

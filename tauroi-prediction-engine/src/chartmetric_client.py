@@ -81,7 +81,7 @@ class ChartmetricClient:
     def __init__(
         self,
         settings: Settings | None = None,
-        timeout: int = 30,
+        timeout: int = 60,
     ) -> None:
         self._settings = settings or load_settings(require_secrets=False)
         self._base_url = self._settings.chartmetric_base_url
@@ -1183,7 +1183,18 @@ class ChartmetricClient:
                     i, n_artists, name, cm_id,
                 )
             else:
-                cm_id = self.search_artist(name)
+                try:
+                    cm_id = self.search_artist(name)
+                except (
+                    requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                ) as exc:
+                    logger.warning(
+                        "  [%d/%d] Timeout searching for '%s': %s — skipping",
+                        i, n_artists, name, str(exc)[:80],
+                    )
+                    continue
                 if cm_id is None:
                     logger.warning("  Could not resolve '%s' — skipping", name)
                     continue
@@ -1200,6 +1211,16 @@ class ChartmetricClient:
                 logger.warning(
                     "  %s — API error (likely rate limit): %s — skipping",
                     name, str(exc)[:120],
+                )
+                continue
+            except (
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                logger.warning(
+                    "  %s — network timeout: %s — skipping",
+                    name, str(exc)[:80],
                 )
                 continue
 
