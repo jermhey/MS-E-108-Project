@@ -549,6 +549,94 @@ class KalshiClient:
 
         return enriched, rejected
 
+    # ── Historical Data ─────────────────────────────────────────────────
+
+    def get_market_candlesticks(
+        self,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 1440,
+    ) -> list[Dict[str, Any]]:
+        """
+        Fetch OHLC candlestick data for a market.
+
+        Endpoint: GET /markets/{ticker}/candlesticks
+
+        Parameters
+        ----------
+        ticker : str
+            Market ticker (e.g. "KXTOPMONTHLY-26FEB-BAD").
+        start_ts : int
+            Start Unix timestamp (seconds).
+        end_ts : int
+            End Unix timestamp (seconds).
+        period_interval : int
+            Candle width in minutes (1, 5, 15, 60, 1440=daily).
+
+        Returns
+        -------
+        list[dict]
+            Each dict has keys: end_period_ts, open, close, high, low, volume.
+        """
+        path = f"/markets/{ticker}/candlesticks"
+        params = {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+
+        data = self._request("GET", path, params=params)
+        raw_candles = data.get("candlesticks", [])
+
+        # Normalise varying response formats into a flat structure
+        candles = []
+        for c in raw_candles:
+            ts = c.get("end_period_ts", 0)
+            # Prices may be nested under "price" or "yes_price" or flat
+            price = c.get("price") or c.get("yes_price") or c
+
+            candles.append({
+                "end_period_ts": ts,
+                "open": price.get("open", 0),
+                "close": price.get("close", 0),
+                "high": price.get("high", 0),
+                "low": price.get("low", 0),
+                "volume": c.get("volume", 0),
+            })
+
+        logger.info(
+            "Fetched %d candlesticks for %s (%d-min interval)",
+            len(candles), ticker, period_interval,
+        )
+        return candles
+
+    def get_market_trades(
+        self,
+        ticker: str,
+        limit: int = 1000,
+        cursor: str | None = None,
+    ) -> tuple[list[Dict[str, Any]], str | None]:
+        """
+        Fetch recent trades for a market.
+
+        Endpoint: GET /markets/trades
+
+        Returns (trades_list, next_cursor).
+        """
+        params: Dict[str, Any] = {
+            "ticker": ticker,
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        data = self._request("GET", "/markets/trades", params=params)
+        trades = data.get("trades", [])
+        next_cursor = data.get("cursor", None)
+        logger.info("Fetched %d trades for %s", len(trades), ticker)
+        return trades, next_cursor
+
     @property
     def is_authenticated(self) -> bool:
         return self._authenticated

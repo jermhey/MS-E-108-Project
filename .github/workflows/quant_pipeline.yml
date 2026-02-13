@@ -5,6 +5,10 @@
 #  fetches real-time data from Chartmetric + Kalshi, computes the model
 #  fair value, and persists the signal to signals/signal_log.jsonl.
 #
+#  IMPORTANT: The application lives in the tauroi-prediction-engine/
+#  subdirectory.  All pip / python / path references use that as the
+#  working-directory.
+#
 #  Triggers:
 #    - Cron: every hour (live market monitoring — respects Chartmetric rate limits)
 #    - Push to main/dev (CI: tests + signal generation)
@@ -32,6 +36,11 @@ concurrency:
   group: quant-pipeline
   cancel-in-progress: true
 
+# ── All jobs share this working directory ────────────────────────────────────
+defaults:
+  run:
+    working-directory: tauroi-prediction-engine
+
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
   #  JOB 1: Unit Tests (fast gate — blocks signal generation if broken)
@@ -47,6 +56,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: tauroi-prediction-engine/requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -77,21 +87,22 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: tauroi-prediction-engine/requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       # ── Restore Chartmetric data cache from previous runs ──────────
       # This avoids re-fetching full history on every run (prevents
-      # rate limiting). The cache key includes the date so it refreshes
-      # daily, ensuring data stays current.
+      # rate limiting). The cache key rolls with run_id so every run
+      # can write back; restore-keys lets it pick up the most recent.
       - name: Restore Chartmetric data cache
         uses: actions/cache@v4
         with:
-          path: cache/
-          key: chartmetric-cache-${{ hashFiles('requirements.txt') }}-${{ github.run_id }}
+          path: tauroi-prediction-engine/cache/
+          key: chartmetric-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-${{ github.run_id }}
           restore-keys: |
-            chartmetric-cache-${{ hashFiles('requirements.txt') }}-
+            chartmetric-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-
 
       - name: Run live signal engine (full market scan)
         env:
@@ -107,15 +118,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: signal-log-${{ github.run_id }}
-          path: signals/signal_log.jsonl
+          path: tauroi-prediction-engine/signals/signal_log.jsonl
           retention-days: 90
 
       - name: Commit signal log to repo
         if: success()
+        # This step must run at the repo root for git commands
+        working-directory: .
         run: |
           git config user.name "Tauroi Bot"
           git config user.email "bot@tauroi.dev"
-          git add signals/signal_log.jsonl
+          git add tauroi-prediction-engine/signals/signal_log.jsonl
           # Only commit if there are changes
           git diff --cached --quiet || \
             git commit -m "signal: $(date -u '+%Y-%m-%d %H:%M UTC')" && \

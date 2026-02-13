@@ -13,6 +13,7 @@ Modes
     python main.py --scan                  # Full market scan — price ALL artists
     python main.py --artist "Taylor Swift" --artist-id 2762  # Override artist
     python main.py --dry-run               # No order execution
+    python main.py --analyze-alpha         # Lead-Lag Alpha Analysis (Avi's report)
     python main.py --loop --interval 900   # Continuous: re-run every 15 min
 
 Signal Persistence
@@ -928,6 +929,7 @@ def run(
     artist_name: str | None = None,
     artist_id: str | None = None,
     no_cache: bool = False,
+    analyze_alpha: bool = False,
 ) -> None:
     """
     Full pipeline: fetch API data -> calibrate -> market -> strategy.
@@ -950,6 +952,8 @@ def run(
         Override the Chartmetric artist ID (defaults to .env).
     no_cache : bool
         If True, skip the local Parquet cache and force a full API fetch.
+    analyze_alpha : bool
+        If True, run Lead-Lag Alpha Analysis after market discovery.
     """
     global ARTIST_NAME
 
@@ -997,6 +1001,13 @@ def run(
         logger.warning("No market found — cannot proceed with strategy.")
         return
 
+    # ── Step 5a (optional): Lead-Lag Alpha Analysis ─────────────────
+    if analyze_alpha:
+        _run_alpha_analysis(
+            settings, cm_client, cal, market_result, df,
+        )
+        return
+
     # ── Step 5: Branch — SCAN or SINGLE-ARTIST ───────────────────────
     if scan:
         return _run_scan_pipeline(
@@ -1007,6 +1018,96 @@ def run(
             cm_client, cal, market_result, df, strike,
             competitor_listeners, dry_run,
         )
+
+
+def _run_alpha_analysis(
+    settings: Settings,
+    cm_client: Any,
+    cal: CalibrationResult,
+    market_result: Dict[str, Any],
+    df: pd.DataFrame,
+) -> None:
+    """
+    Lead-Lag Alpha Analysis: determine if our model signal leads or
+    lags the Kalshi market price.
+
+    Uses historical Kalshi candlestick/trade data and walk-forward
+    model reconstruction from Chartmetric data.
+    """
+    from src.analysis.lead_lag import LeadLagAnalyzer
+    from src.kalshi_client import KalshiClient
+
+    contract = market_result["target_contract"]
+    ticker = contract.get("ticker", "")
+    expiry_str = contract.get("close_time", contract.get("expiration_time", ""))
+
+    # Parse expiry date
+    expiry_date = None
+    if expiry_str:
+        try:
+            dt = datetime.datetime.fromisoformat(
+                expiry_str.replace("Z", "+00:00")
+            )
+            expiry_date = dt.date()
+        except (ValueError, TypeError):
+            pass
+
+    if expiry_date is None:
+        # Default to ~30 days from now
+        expiry_date = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        ).date()
+
+    # Determine strike for this market
+    # For WTA markets, the "strike" is the max competitor listeners
+    competitors = market_result.get("competitors", [])
+    if market_result["market_type"] == "winner_take_all" and competitors:
+        # Use the leader's listener count (heuristic: from last scan or default)
+        strike = DEFAULT_STRIKE
+        logger.info(
+            "WTA market detected — using default strike $%s for alpha analysis",
+            f"{strike:,.0f}",
+        )
+    else:
+        strike = DEFAULT_STRIKE
+
+    # Build Kalshi client for candlestick access
+    kalshi = KalshiClient(settings=settings)
+
+    # Run the analyzer
+    analyzer = LeadLagAnalyzer(
+        kalshi_client=kalshi,
+        cm_client=cm_client,
+        calibration=cal,
+    )
+
+    output_path = str(
+        pathlib.Path(__file__).resolve().parent / "lead_lag.png"
+    )
+
+    result = analyzer.run(
+        ticker=ticker,
+        artist_name=ARTIST_NAME,
+        artist_data=df,
+        strike=strike,
+        expiry_date=expiry_date,
+        max_lag=10,
+        output_path=output_path,
+    )
+
+    if result is not None:
+        # Log the result
+        append_signal_log({
+            "artist": ARTIST_NAME,
+            "signal": "ALPHA_ANALYSIS",
+            "ticker": ticker,
+            "optimal_lag": result.optimal_lag,
+            "optimal_corr": result.optimal_corr,
+            "lag_unit": result.lag_unit,
+            "n_observations": result.n_observations,
+            "granger_f": result.granger_f_stat,
+            "granger_p": result.granger_p_value,
+        })
 
 
 def _run_scan_pipeline(
@@ -1181,6 +1282,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    # ── Analysis ──────────────────────────────────────────────────────
+    parser.add_argument(
+        "--analyze-alpha",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the Lead-Lag Alpha Analysis: cross-correlate our model "
+            "signal against Kalshi price history to measure timing edge."
+        ),
+    )
+
     # ── Cache control ────────────────────────────────────────────────
     parser.add_argument(
         "--no-cache",
@@ -1224,6 +1336,7 @@ def main(argv: list[str] | None = None) -> None:
                 artist_name=args.artist,
                 artist_id=args.artist_id,
                 no_cache=args.no_cache,
+                analyze_alpha=args.analyze_alpha,
             )
         except KeyboardInterrupt:
             raise
