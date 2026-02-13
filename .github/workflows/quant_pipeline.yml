@@ -70,6 +70,8 @@ jobs:
   signal:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write           # required for git push (signal log commit)
 
     # Only run the live engine if secrets are configured
     # (forks / PRs won't have them)
