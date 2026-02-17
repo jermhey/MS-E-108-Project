@@ -36,6 +36,7 @@ class CalibrationResult:
     best_lag: int         # optimal lag in days (1, 2, or 3)
     tiktok_p95: float     # 95th percentile of tiktok_sound_posts_change
     vol_gamma: float      # conditional vol sensitivity (TikTok → vol)
+    theta: float = 0.1    # OU mean-reversion speed (annualised)
 
     def to_dict(self) -> Dict[str, float | int]:
         return {
@@ -44,6 +45,7 @@ class CalibrationResult:
             "best_lag": self.best_lag,
             "tiktok_p95": self.tiktok_p95,
             "vol_gamma": self.vol_gamma,
+            "theta": self.theta,
         }
 
 
@@ -328,6 +330,57 @@ class Calibrator:
         )
         return gamma_annual
 
+    # ── theta: mean-reversion speed ────────────────────────────────────
+
+    def compute_theta(self) -> float:
+        """
+        Mean-Reversion Speed (theta) for the Ornstein-Uhlenbeck model.
+
+        Listener counts are "sticky" — an artist at 100M today is
+        overwhelmingly likely to be near 100M tomorrow.  Theta quantifies
+        how strongly the process pulls back toward its long-term mean.
+
+        Method
+        ------
+        1.  Compute the lag-1 autocorrelation (rho) of daily listener
+            *levels* (not returns).  For a discrete OU process sampled
+            at interval dt:  ``rho = exp(-theta * dt)``.
+
+        2.  Invert:  ``theta = -ln(rho) / dt``   (annualised).
+
+        3.  Clamp to [0.01, 10.0] to avoid degenerate values.
+
+        Returns
+        -------
+        float
+            Annualised mean-reversion speed.  Higher = stickier.
+        """
+        listeners = self.df["spotify_monthly_listeners"].astype(float).dropna()
+
+        if len(listeners) < 30:
+            logger.warning("Too few data points for theta — using default 0.1")
+            return 0.1
+
+        # Lag-1 autocorrelation of levels
+        rho = float(listeners.autocorr(lag=1))
+
+        if np.isnan(rho) or rho <= 0 or rho >= 1.0:
+            logger.info("Autocorrelation invalid (rho=%.4f) — using default 0.1", rho)
+            return 0.1
+
+        dt = 1.0 / 365.0
+        theta = -math.log(rho) / dt
+
+        # Clamp to reasonable range
+        theta = float(np.clip(theta, 0.01, 10.0))
+
+        logger.info(
+            "OU theta — rho=%.6f | theta_annual=%.4f "
+            "(half-life ≈ %.1f days)",
+            rho, theta, math.log(2) / theta * 365 if theta > 0 else float("inf"),
+        )
+        return theta
+
     # ── normalisation stats ─────────────────────────────────────────────
 
     def compute_tiktok_p95(self) -> float:
@@ -368,12 +421,15 @@ class Calibrator:
             raw_gamma * 100, vol_gamma * 100,
         )
 
+        theta = self.compute_theta()
+
         result = CalibrationResult(
             sigma=sigma,
             jump_beta=jump_beta,
             best_lag=best_lag,
             tiktok_p95=tiktok_p95,
             vol_gamma=vol_gamma,
+            theta=theta,
         )
 
         logger.info("Calibration complete: %s", result.to_dict())

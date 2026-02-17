@@ -1,25 +1,28 @@
 """
-pricing_engine.py — Modified Merton Jump-Diffusion Pricing Model
-=================================================================
-Prices a **binary call option** on a prediction-market settlement value
-(e.g. "Will Bad Bunny exceed 100 M monthly listeners by March 1?").
+pricing_engine.py — Pricing Models for Prediction Markets
+============================================================
+Two engines for pricing prediction-market contracts on Spotify listeners:
 
-Two operating modes:
+**Engine 1: JumpDiffusionPricer (legacy / binary-call mode)**
+    Closed-form Black-Scholes binary call: P = e^{-rT} * N(d2).
+    Best for single-artist threshold contracts ("Will X exceed 100M?").
+    Retained for backward compatibility with unit tests.
 
-1.  **Default (Phase 1)** — uses hardcoded ``ModelParams`` and an additive
-    nowcast:  ``S = S_official + velocity * correlation_factor``
+**Engine 2: MonteCarloOU (Winner-Take-All mode)**
+    Ornstein-Uhlenbeck (mean-reverting) Monte Carlo simulation.
+    Runs 10,000 paths for ALL artists simultaneously; at expiry,
+    the artist with max listeners wins.
 
-2.  **Calibrated (Phase 3)** — accepts empirical ``sigma`` and ``jump_beta``
-    from the ``Calibrator`` and uses a multiplicative nowcast:
-        ``S_adj = S_current * (1 + normalised_velocity * jump_beta)``
+    P(artist_i) = #{paths where i has max listeners} / n_paths
 
-The fair value of the binary call is always:
+    This naturally produces probabilities that sum to 1.0 —
+    no post-hoc normalization needed.
 
-    P = e^{-rT} * N(d_2)
+    The OU process models listener counts as "sticky":
+        dX = theta * (mu - X) * dt + sigma_abs * dW
 
-where
-
-    d_2 = [ln(S / K) + (r - 0.5 * sigma_adj^2) * T] / (sigma_adj * sqrt(T))
+    where mu is adjusted for TikTok velocity via jump_beta:
+        mu_i = spot_i * (1 + beta * velocity_i)
 """
 
 from __future__ import annotations
@@ -357,3 +360,154 @@ class JumpDiffusionPricer:
             return float(iv)
         except ValueError:
             return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Engine 2: Ornstein-Uhlenbeck Monte Carlo (Winner-Take-All markets)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OUArtistInput:
+    """Per-artist inputs for the Monte Carlo simulation."""
+
+    name: str
+    listeners: float            # current Spotify monthly listeners (spot)
+    sigma: float                # annualised percentage volatility (e.g. 1.55)
+    norm_velocity: float = 0.0  # TikTok velocity normalised to [0, 1]
+
+
+@dataclass
+class OUArtistResult:
+    """Per-artist outputs from the Monte Carlo simulation."""
+
+    name: str
+    probability: float      # win probability ∈ [0, 1], sum across artists = 1.0
+    win_count: int           # raw path wins out of n_paths
+    avg_final: float         # mean listener count at expiry across all paths
+    p5_final: float          # 5th percentile of final listener count
+    p95_final: float         # 95th percentile of final listener count
+    spot: float              # input spot (for reference)
+    mu: float                # long-term mean used in the simulation
+
+
+class MonteCarloOU:
+    """
+    Ornstein-Uhlenbeck Monte Carlo simulator for Winner-Take-All markets.
+
+    Simulates **all** artists simultaneously.  At expiry, the artist with
+    the most listeners wins.  The win count across paths IS the probability
+    — no normalization hack needed.
+
+    The OU process keeps listener counts "sticky":
+
+        X_{t+dt} = X_t + theta * (mu_i - X_t) * dt + sigma_abs_i * sqrt(dt) * Z
+
+    where:
+        theta     — mean-reversion speed (higher = stickier)
+        mu_i      — long-term mean, = spot * (1 + beta * velocity)
+        sigma_abs — absolute vol = sigma_pct * spot
+
+    Parameters
+    ----------
+    theta : float
+        Annualised mean-reversion speed.  0.1 = slow pull.
+        Calibrated from lag-1 autocorrelation if available.
+    n_paths : int
+        Number of Monte Carlo paths (default 10,000).
+    seed : int or None
+        Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        theta: float = 0.1,
+        n_paths: int = 10_000,
+        seed: int | None = 42,
+    ) -> None:
+        self.theta = theta
+        self.n_paths = n_paths
+        self.seed = seed
+
+    def simulate_wta(
+        self,
+        artists: list[OUArtistInput],
+        T: float,
+        jump_beta: float = 0.0,
+    ) -> list[OUArtistResult]:
+        """
+        Run the full WTA Monte Carlo simulation.
+
+        Parameters
+        ----------
+        artists : list[OUArtistInput]
+            Per-artist spot, sigma, and velocity.
+        T : float
+            Time to expiry in years (e.g. 15/365).
+        jump_beta : float
+            TikTok → listener lagged correlation.  Shifts the
+            long-term mean upward for viral artists.
+
+        Returns
+        -------
+        list[OUArtistResult]
+            One result per artist, sorted by probability descending.
+            Probabilities sum to 1.0 by construction.
+        """
+        n_artists = len(artists)
+        n_steps = max(int(T * 365), 1)
+        dt = T / n_steps
+        sqrt_dt = math.sqrt(dt)
+
+        rng = np.random.default_rng(self.seed)
+
+        # ── Extract per-artist parameter vectors ──────────────────────
+        spots = np.array(
+            [a.listeners for a in artists], dtype=np.float64,
+        )
+        sigmas_pct = np.array(
+            [a.sigma for a in artists], dtype=np.float64,
+        )
+        velocities = np.array(
+            [a.norm_velocity for a in artists], dtype=np.float64,
+        )
+
+        # Long-term mean: current spot adjusted for TikTok momentum
+        mu = spots * (1.0 + jump_beta * velocities)
+
+        # Convert percentage vol to absolute vol
+        # sigma_abs = annualised_pct_vol * spot
+        sigma_abs = sigmas_pct * spots
+
+        # ── Initialise paths: shape (n_paths, n_artists) ─────────────
+        X = np.tile(spots, (self.n_paths, 1))
+
+        # ── Simulate ─────────────────────────────────────────────────
+        for _ in range(n_steps):
+            Z = rng.standard_normal((self.n_paths, n_artists))
+            drift = self.theta * (mu - X) * dt
+            diffusion = sigma_abs * sqrt_dt * Z
+            X = X + drift + diffusion
+            np.maximum(X, 0, out=X)  # listeners can't go negative
+
+        # ── Count wins ───────────────────────────────────────────────
+        winners = np.argmax(X, axis=1)                # (n_paths,)
+        win_counts = np.bincount(winners, minlength=n_artists)
+        probs = win_counts / self.n_paths
+
+        # ── Build results ────────────────────────────────────────────
+        results = []
+        for i, artist in enumerate(artists):
+            results.append(OUArtistResult(
+                name=artist.name,
+                probability=float(probs[i]),
+                win_count=int(win_counts[i]),
+                avg_final=float(X[:, i].mean()),
+                p5_final=float(np.percentile(X[:, i], 5)),
+                p95_final=float(np.percentile(X[:, i], 95)),
+                spot=float(spots[i]),
+                mu=float(mu[i]),
+            ))
+
+        # Sort by probability descending
+        results.sort(key=lambda r: r.probability, reverse=True)
+        return results

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import pathlib
 import time as _time
 import sys
@@ -37,7 +38,7 @@ import pandas as pd
 
 from src.calibration import Calibrator, CalibrationResult
 from src.config import load_settings, Settings
-from src.pricing_engine import JumpDiffusionPricer, ModelParams
+from src.pricing_engine import JumpDiffusionPricer, ModelParams, MonteCarloOU, OUArtistInput
 from src.utils import get_logger, format_signal
 
 
@@ -259,12 +260,11 @@ def run_calibration_from_df(df: pd.DataFrame) -> CalibrationResult:
     print(f"  Base Volatility (sigma)      : {result.sigma:>11.2%}  (annualised)")
     print(f"  Vol Gamma (gamma)            : {result.vol_gamma:>11.2%}  (conditional)")
     print(f"  Jump Sensitivity (beta)      : {result.jump_beta:>12.6f}")
+    print(f"  Mean Reversion (theta)       : {result.theta:>12.4f}  (OU speed)")
+    hl = math.log(2) / result.theta * 365 if result.theta > 0 else float("inf")
+    print(f"  Half-Life                    : {hl:>11.1f}  days")
     print(f"  Best TikTok Lag              : {result.best_lag:>12d}  days")
     print(f"  TikTok P95 (norm cap)        : {result.tiktok_p95:>12,.0f}")
-    print("  " + "=" * 52)
-    print(f"  sigma at velocity=0.0        : {result.sigma:>11.2%}")
-    print(f"  sigma at velocity=0.5        : {result.sigma + result.vol_gamma * 0.5:>11.2%}")
-    print(f"  sigma at velocity=1.0        : {result.sigma + result.vol_gamma:>11.2%}")
     print("  " + "=" * 52)
     print()
 
@@ -687,34 +687,48 @@ def run_market_scan(
     for c in market_result.get("competitors", []):
         kalshi_lookup[c["name"]] = c
 
-    pricer = JumpDiffusionPricer()
+    # ══════════════════════════════════════════════════════════════════
+    #  Monte Carlo OU Simulation (replaces per-artist GBM)
+    # ══════════════════════════════════════════════════════════════════
+    # Simulate ALL artists simultaneously using a mean-reverting
+    # Ornstein-Uhlenbeck process.  At expiry, the artist with the most
+    # listeners wins.  Probabilities sum to 1.0 by construction — no
+    # normalization hack needed.
+    N_PATHS = 10_000
+
+    mc_inputs = [
+        OUArtistInput(
+            name=a["name"],
+            listeners=float(a["listeners"]),
+            sigma=float(a.get("sigma", cal.sigma)),
+            norm_velocity=float(a.get("norm_velocity", 0.0)),
+        )
+        for a in all_artists
+    ]
+
+    mc = MonteCarloOU(theta=cal.theta, n_paths=N_PATHS, seed=42)
+    mc_results = mc.simulate_wta(mc_inputs, T=T, jump_beta=cal.jump_beta)
+
+    logger.info(
+        "MC-OU simulation complete: %d artists × %d paths × %d steps "
+        "| theta=%.4f | sum(P)=%.4f",
+        len(mc_inputs), N_PATHS, max(int(T * 365), 1),
+        cal.theta,
+        sum(r.probability for r in mc_results),
+    )
+
+    # Build a lookup from MC results by name
+    mc_lookup = {r.name: r for r in mc_results}
+
     scan_rows: list[Dict[str, Any]] = []
 
     for artist in all_artists:
         name = artist["name"]
-        spot = float(artist["listeners"])
-        change_pct = artist.get("change_pct")
-        artist_sigma = float(artist.get("sigma", cal.sigma))
-        norm_velocity = float(artist.get("norm_velocity", 0.0))
+        mc_r = mc_lookup.get(name)
+        if mc_r is None:
+            continue
 
-        # Strike = max listeners among all OTHER artists
-        others_max = max(
-            (a["listeners"] for a in all_artists if a["name"] != name),
-            default=spot,
-        )
-        effective_strike = float(others_max)
-
-        # Per-artist pricing: their OWN sigma + velocity, shared gamma/beta
-        fair_value = pricer.fair_value_calibrated(
-            spot_official=spot,
-            normalized_velocity=norm_velocity,
-            strike=effective_strike,
-            sigma=artist_sigma,
-            jump_beta=cal.jump_beta,
-            vol_gamma=cal.vol_gamma,
-            event_impact_score=1.0,
-            T=T,
-        )
+        fair_value = mc_r.probability
 
         # Market price from Kalshi
         kc = kalshi_lookup.get(name, {})
@@ -734,10 +748,10 @@ def run_market_scan(
 
         scan_rows.append({
             "name": name,
-            "listeners": int(spot),
-            "change_pct": change_pct,
-            "sigma": artist_sigma,
-            "norm_velocity": norm_velocity,
+            "listeners": int(mc_r.spot),
+            "change_pct": artist.get("change_pct"),
+            "sigma": float(artist.get("sigma", cal.sigma)),
+            "norm_velocity": float(artist.get("norm_velocity", 0.0)),
             "tiktok_velocity": artist.get("tiktok_velocity", 0),
             "spotify_followers": artist.get("spotify_followers", 0),
             "spotify_popularity": artist.get("spotify_popularity", 0),
@@ -747,7 +761,7 @@ def run_market_scan(
             "wikipedia_views": artist.get("wikipedia_views", 0),
             "playlist_reach": artist.get("playlist_reach", 0),
             "num_playlists": artist.get("num_playlists", 0),
-            "strike": int(effective_strike),
+            "strike": "WTA",
             "fair_value": round(fair_value, 4),
             "market_price": round(market_price, 4),
             "edge": round(edge, 4),
@@ -757,46 +771,27 @@ def run_market_scan(
             "data_points": artist.get("data_points", 0),
             "history_start": artist.get("history_start"),
             "history_end": artist.get("history_end"),
+            "mc_avg_final": int(mc_r.avg_final),
+            "mc_p5": int(mc_r.p5_final),
+            "mc_p95": int(mc_r.p95_final),
+            "mc_wins": mc_r.win_count,
         })
-
-    # ══════════════════════════════════════════════════════════════════
-    #  WTA Probability Normalization
-    # ══════════════════════════════════════════════════════════════════
-    # In a Winner-Take-All market, exactly one artist wins, so the
-    # probabilities MUST sum to 1.0.  The raw model computes each
-    # artist's probability independently (GBM doesn't know about
-    # mutual exclusivity), so we rescale:
-    #     P_normalized(i) = P_raw(i) / Σ P_raw(j)
-    # Then recompute edge and signal from the normalized values.
-    total_fv = sum(r["fair_value"] for r in scan_rows)
-    if total_fv > 0:
-        norm_factor = total_fv
-        logger.info(
-            "Normalizing WTA probabilities: raw sum = %.2f%% → 100%% "
-            "(factor = %.4f)",
-            total_fv * 100, norm_factor,
-        )
-        for r in scan_rows:
-            r["raw_fair_value"] = r["fair_value"]
-            r["fair_value"] = round(r["fair_value"] / norm_factor, 4)
-            r["edge"] = round(r["fair_value"] - r["market_price"], 4)
-            r["signal"] = format_signal(r["edge"], threshold=EDGE_THRESHOLD)
 
     # Sort by edge descending (best opportunities first)
     scan_rows.sort(key=lambda r: r["edge"], reverse=True)
 
     # ── Print the scan table ──────────────────────────────────────────
     print()
-    print("  " + "=" * 100)
-    print(f"  FULL MARKET SCAN — Per-Artist Calibration")
+    print("  " + "=" * 110)
+    print(f"  FULL MARKET SCAN — Ornstein-Uhlenbeck Monte Carlo ({N_PATHS:,} paths)")
     print(f"  {event_title}")
-    print(f"  T = {T * 365:.1f} days to expiry  |  Gamma (shared) = {cal.vol_gamma:.2%}  |  Beta (shared) = {cal.jump_beta:.4f}")
-    print("  " + "=" * 100)
+    print(f"  T = {T * 365:.1f} days  |  theta = {cal.theta:.4f}  |  beta = {cal.jump_beta:.4f}  |  sum(P) = {sum(r.probability for r in mc_results):.4f}")
+    print("  " + "=" * 110)
     print()
     print(f"  {'Artist':<22s} {'Listeners':>14s} {'7d Chg':>8s}"
           f" {'Sigma':>8s} {'TikTok':>8s}"
-          f" {'Model':>8s} {'Kalshi':>8s} {'Edge':>8s}  {'Signal':<6s}")
-    print("  " + "-" * 100)
+          f" {'Model':>8s} {'Kalshi':>8s} {'Edge':>8s}  {'Signal':<6s} {'Wins':>7s}")
+    print("  " + "-" * 110)
 
     for row in scan_rows:
         chg = f"{row['change_pct']:+.1f}%" if row["change_pct"] is not None else "—"
@@ -805,14 +800,15 @@ def run_market_scan(
         fv_pct = f"{row['fair_value']:.1%}"
         mkt = f"{row['kalshi_last']}c" if row["kalshi_last"] else "—"
         edge_str = f"{row['edge']:+.1%}"
+        wins_str = f"{row.get('mc_wins', 0):,}"
         star = " *" if row["signal"] == "BUY" else ""
         print(
             f"  {row['name']:<22s} {row['listeners']:>14,d} {chg:>8s}"
             f" {sigma_str:>8s} {vel_str:>8s}"
-            f" {fv_pct:>8s} {mkt:>8s} {edge_str:>8s}  {row['signal']:<6s}{star}"
+            f" {fv_pct:>8s} {mkt:>8s} {edge_str:>8s}  {row['signal']:<6s}{wins_str:>7s}{star}"
         )
 
-    print("  " + "-" * 100)
+    print("  " + "-" * 110)
 
     # Highlight the best opportunity
     buys = [r for r in scan_rows if r["signal"] == "BUY"]
@@ -864,11 +860,11 @@ def run_market_scan(
     # ── Persist each signal ───────────────────────────────────────────
     for row in scan_rows:
         append_signal_log({
-            "mode": "scan",
+            "mode": "scan_mc_ou",
+            "model": "ornstein_uhlenbeck",
             "artist": row["name"],
             "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
             "spot_official": row["listeners"],
-            "strike": row["strike"],
             "market_type": "winner_take_all",
             "fair_value": row["fair_value"],
             "market_price": row["market_price"],
@@ -876,13 +872,18 @@ def run_market_scan(
             "signal": row["signal"],
             "sigma": round(row["sigma"], 6),
             "norm_velocity": row["norm_velocity"],
+            "theta": round(cal.theta, 6),
+            "mc_paths": N_PATHS,
+            "mc_wins": row.get("mc_wins", 0),
+            "mc_avg_final": row.get("mc_avg_final", 0),
+            "mc_p5": row.get("mc_p5", 0),
+            "mc_p95": row.get("mc_p95", 0),
             "spotify_followers": row.get("spotify_followers", 0),
             "spotify_popularity": row.get("spotify_popularity", 0),
             "youtube_views": row.get("youtube_views", 0),
             "instagram_followers": row.get("instagram_followers", 0),
             "deezer_fans": row.get("deezer_fans", 0),
             "wikipedia_views": row.get("wikipedia_views", 0),
-            "playlist_reach": row.get("playlist_reach", 0),
             "data_points": row.get("data_points", 0),
             "history_start": row.get("history_start"),
             "history_end": row.get("history_end"),
