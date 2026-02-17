@@ -46,6 +46,12 @@ from src.utils import get_logger, format_signal
 
 EDGE_THRESHOLD = 0.05
 DEFAULT_STRIKE = 100_000_000
+# Multi-window sigma: None = auto (max of 90d/180d/365d windows).
+# Set to an int to force a single window (e.g. 90 for 90-day only).
+SIGMA_WINDOW: int | None = None
+# Analytical contention filter: min P(beats leader) to stay in the MC.
+# Fully data-driven via OU closed-form.  0.001 = 0.1%.
+MIN_CONTENTION_PROB = 0.001
 SIGNAL_LOG_DIR = pathlib.Path(__file__).resolve().parent / "signals"
 
 logger = get_logger("tauroi.main")
@@ -690,30 +696,42 @@ def run_market_scan(
     # ══════════════════════════════════════════════════════════════════
     #  Monte Carlo OU Simulation (replaces per-artist GBM)
     # ══════════════════════════════════════════════════════════════════
-    # Simulate ALL artists simultaneously using a mean-reverting
-    # Ornstein-Uhlenbeck process.  At expiry, the artist with the most
-    # listeners wins.  Probabilities sum to 1.0 by construction — no
-    # normalization hack needed.
+    # Simulate ALL artists simultaneously using a trending OU process.
+    # Each artist has:
+    #   - sigma: volatility (multi-window, from recent data)
+    #   - trend: directional momentum (14d listener slope + TikTok)
+    #   - velocity: TikTok virality (shifts long-term mean via jump_beta)
+    # Probabilities sum to 1.0 by construction.
     N_PATHS = 10_000
 
-    mc_inputs = [
-        OUArtistInput(
+    mc_inputs = []
+    for a in all_artists:
+        spot = float(a["listeners"])
+        # Trend: annualised absolute drift from observed growth signals.
+        # Primary signal: 14-day OLS slope of daily listeners (most robust).
+        # The raw slope is in listeners/day — annualise by *365.
+        trend_daily = float(a.get("listener_trend_daily", 0.0))
+        trend_annual = trend_daily * 365.0
+
+        mc_inputs.append(OUArtistInput(
             name=a["name"],
-            listeners=float(a["listeners"]),
+            listeners=spot,
             sigma=float(a.get("sigma", cal.sigma)),
             norm_velocity=float(a.get("norm_velocity", 0.0)),
-        )
-        for a in all_artists
-    ]
+            trend=trend_annual,
+        ))
 
     mc = MonteCarloOU(theta=cal.theta, n_paths=N_PATHS, seed=42)
-    mc_results = mc.simulate_wta(mc_inputs, T=T, jump_beta=cal.jump_beta)
+    mc_results = mc.simulate_wta(
+        mc_inputs, T=T, jump_beta=cal.jump_beta,
+        min_contention_prob=MIN_CONTENTION_PROB,
+    )
 
     logger.info(
         "MC-OU simulation complete: %d artists × %d paths × %d steps "
-        "| theta=%.4f | sum(P)=%.4f",
+        "| theta=%.4f | min_contention=%.4f | sigma_window=%s | sum(P)=%.4f",
         len(mc_inputs), N_PATHS, max(int(T * 365), 1),
-        cal.theta,
+        cal.theta, MIN_CONTENTION_PROB, SIGMA_WINDOW,
         sum(r.probability for r in mc_results),
     )
 
@@ -750,6 +768,7 @@ def run_market_scan(
             "name": name,
             "listeners": int(mc_r.spot),
             "change_pct": artist.get("change_pct"),
+            "listener_trend_daily": artist.get("listener_trend_daily", 0.0),
             "sigma": float(artist.get("sigma", cal.sigma)),
             "norm_velocity": float(artist.get("norm_velocity", 0.0)),
             "tiktok_velocity": artist.get("tiktok_velocity", 0),
@@ -785,16 +804,19 @@ def run_market_scan(
     print("  " + "=" * 110)
     print(f"  FULL MARKET SCAN — Ornstein-Uhlenbeck Monte Carlo ({N_PATHS:,} paths)")
     print(f"  {event_title}")
-    print(f"  T = {T * 365:.1f} days  |  theta = {cal.theta:.4f}  |  beta = {cal.jump_beta:.4f}  |  sum(P) = {sum(r.probability for r in mc_results):.4f}")
+    sw_label = f"{SIGMA_WINDOW}d" if SIGMA_WINDOW else "multi(90/180/365)"
+    print(f"  T = {T * 365:.1f} days  |  theta = {cal.theta:.4f}  |  beta = {cal.jump_beta:.4f}  |  sigma = {sw_label}  |  min_contention = {MIN_CONTENTION_PROB}  |  sum(P) = {sum(r.probability for r in mc_results):.4f}")
     print("  " + "=" * 110)
     print()
-    print(f"  {'Artist':<22s} {'Listeners':>14s} {'7d Chg':>8s}"
+    print(f"  {'Artist':<22s} {'Listeners':>14s} {'7d Chg':>8s} {'Trend/d':>9s}"
           f" {'Sigma':>8s} {'TikTok':>8s}"
           f" {'Model':>8s} {'Kalshi':>8s} {'Edge':>8s}  {'Signal':<6s} {'Wins':>7s}")
-    print("  " + "-" * 110)
+    print("  " + "-" * 120)
 
     for row in scan_rows:
         chg = f"{row['change_pct']:+.1f}%" if row["change_pct"] is not None else "—"
+        trend_d = row.get("listener_trend_daily", 0.0)
+        trend_str = f"{trend_d/1e6:+.2f}M" if abs(trend_d) >= 1000 else f"{trend_d:+.0f}"
         sigma_str = f"{row['sigma']:.0%}"
         vel_str = f"{row['norm_velocity']:.2f}" if row["norm_velocity"] > 0 else "—"
         fv_pct = f"{row['fair_value']:.1%}"
@@ -803,7 +825,7 @@ def run_market_scan(
         wins_str = f"{row.get('mc_wins', 0):,}"
         star = " *" if row["signal"] == "BUY" else ""
         print(
-            f"  {row['name']:<22s} {row['listeners']:>14,d} {chg:>8s}"
+            f"  {row['name']:<22s} {row['listeners']:>14,d} {chg:>8s} {trend_str:>9s}"
             f" {sigma_str:>8s} {vel_str:>8s}"
             f" {fv_pct:>8s} {mkt:>8s} {edge_str:>8s}  {row['signal']:<6s}{wins_str:>7s}{star}"
         )
@@ -872,7 +894,10 @@ def run_market_scan(
             "signal": row["signal"],
             "sigma": round(row["sigma"], 6),
             "norm_velocity": row["norm_velocity"],
+            "listener_trend_daily": row.get("listener_trend_daily", 0.0),
             "theta": round(cal.theta, 6),
+            "sigma_window": SIGMA_WINDOW,
+            "min_contention_prob": MIN_CONTENTION_PROB,
             "mc_paths": N_PATHS,
             "mc_wins": row.get("mc_wins", 0),
             "mc_avg_final": row.get("mc_avg_final", 0),
@@ -1184,6 +1209,7 @@ def _run_scan_pipeline(
         all_names,
         since=DEFAULT_HISTORY_START,
         use_cache=not no_cache,
+        sigma_window=SIGMA_WINDOW,
     )
 
     if not all_artists:

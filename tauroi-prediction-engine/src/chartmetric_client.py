@@ -848,6 +848,7 @@ class ChartmetricClient:
         name: str,
         since: str = DEFAULT_HISTORY_START,
         use_cache: bool = True,
+        sigma_window: int | None = None,
     ) -> Dict[str, Any] | None:
         """
         Fetch a **full-history, multi-source** data package for one artist.
@@ -880,7 +881,9 @@ class ChartmetricClient:
         if use_cache:
             fresh_df = self._try_load_fresh_cache(cm_id, name)
             if fresh_df is not None:
-                return self._build_scan_result(fresh_df, cm_id, name)
+                return self._build_scan_result(
+                    fresh_df, cm_id, name, sigma_window=sigma_window,
+                )
 
         # ── 2. Determine fetch range ─────────────────────────────────
         stale_cache = self._load_stale_cache(cm_id) if use_cache else None
@@ -1020,15 +1023,35 @@ class ChartmetricClient:
         if use_cache:
             self._save_to_cache(cm_id, name, merged)
 
-        return self._build_scan_result(merged, cm_id, name)
+        return self._build_scan_result(
+            merged, cm_id, name, sigma_window=sigma_window,
+        )
+
+    # Default windows for multi-window sigma estimation.
+    # Uses the MAX sigma across several recent time scales to
+    # automatically capture event risk (album drops, viral moments)
+    # without including multi-year structural growth.
+    _SIGMA_WINDOWS = [90, 180, 365]
+    _SIGMA_FLOOR = 0.05  # minimum credible annualised vol
 
     def _build_scan_result(
         self,
         merged: pd.DataFrame,
         cm_id: int,
         name: str,
+        sigma_window: int | None = None,
     ) -> Dict[str, Any] | None:
-        """Build the enriched per-artist result dict from a merged DataFrame."""
+        """Build the enriched per-artist result dict from a merged DataFrame.
+
+        Parameters
+        ----------
+        sigma_window : int or None
+            If set, use only the last ``sigma_window`` days for sigma.
+            If None (default), use **multi-window estimation**: compute
+            sigma over 90d, 180d, and 365d windows and take the max.
+            This automatically captures event risk at any time scale
+            without including multi-year structural growth.
+        """
         import math
 
         if merged.empty or "spotify_monthly_listeners" not in merged.columns:
@@ -1038,24 +1061,33 @@ class ChartmetricClient:
         if "tiktok_sound_posts_change" not in merged.columns:
             merged = self._compute_velocity(merged)
 
-        # ── Per-artist sigma ─────────────────────────────────────────
+        # ── Per-artist sigma (multi-window, no range floor) ──────────
+        # Compute realized vol over several recent windows and take the
+        # MAX.  This adapts to each artist's recent dynamics: if they
+        # had an album drop 4 months ago, the 180d window catches it.
+        # If they've been quiet, the 365d window provides a baseline.
+        # No manual tuning — the data decides.
         listeners = merged["spotify_monthly_listeners"].astype(float)
-        pct_change = listeners.pct_change().dropna()
 
-        if not pct_change.empty and len(pct_change) >= 5:
-            sigma_sample = float(pct_change.std()) * math.sqrt(365)
-            p_min, p_max = float(listeners.min()), float(listeners.max())
-            n_days = max(len(listeners) - 1, 1)
-            if p_min > 0:
-                range_pct = (p_max - p_min) / p_min
-                sigma_range = (
-                    (range_pct / math.sqrt(n_days)) * math.sqrt(365)
-                )
-            else:
-                sigma_range = 0.0
-            sigma = max(sigma_sample, sigma_range)
+        if sigma_window is not None:
+            # Explicit single window
+            windows = [sigma_window]
         else:
-            sigma = 0.20  # fallback
+            # Multi-window: use all windows that fit the data
+            windows = [w for w in self._SIGMA_WINDOWS if w < len(listeners)]
+            if not windows:
+                windows = [len(listeners)]
+
+        best_sigma = self._SIGMA_FLOOR
+        for w in windows:
+            recent = listeners.iloc[-w:]
+            pct_change = recent.pct_change().dropna()
+            if len(pct_change) >= 5:
+                s = float(pct_change.std()) * math.sqrt(365)
+                if s > best_sigma:
+                    best_sigma = s
+
+        sigma = max(best_sigma, self._SIGMA_FLOOR)
 
         # ── Latest values (from the last row of the merged DF) ───────
         latest = merged.iloc[-1]
@@ -1109,6 +1141,25 @@ class ChartmetricClient:
                     (latest_listeners - old) / old * 100, 2,
                 )
 
+        # ── Listener trend (14-day OLS slope) ────────────────────────
+        # More robust than point-to-point change_pct: fits a line
+        # through the last 14 days of daily listeners.  The slope
+        # (listeners gained per day) directly feeds the MC drift term.
+        listener_trend_daily = 0.0  # listeners/day
+        trend_window = min(14, len(listeners))
+        if trend_window >= 5:
+            recent_trend = listeners.iloc[-trend_window:].dropna()
+            if len(recent_trend) >= 5:
+                x = np.arange(len(recent_trend), dtype=np.float64)
+                y = recent_trend.values.astype(np.float64)
+                # OLS slope: Σ(x-x̄)(y-ȳ) / Σ(x-x̄)²
+                x_mean, y_mean = x.mean(), y.mean()
+                ss_xx = float(np.sum((x - x_mean) ** 2))
+                if ss_xx > 0:
+                    listener_trend_daily = float(
+                        np.sum((x - x_mean) * (y - y_mean)) / ss_xx
+                    )
+
         # Playlist reach (best effort)
         playlist_data = self.get_artist_playlist_reach(cm_id)
 
@@ -1118,6 +1169,7 @@ class ChartmetricClient:
             "df": merged,
             "listeners": latest_listeners,
             "change_pct": change_pct,
+            "listener_trend_daily": round(listener_trend_daily, 1),
             "sigma": round(sigma, 6),
             "tiktok_velocity": latest_velocity,
             "tiktok_p95": tiktok_p95,
@@ -1142,6 +1194,7 @@ class ChartmetricClient:
         artist_names: List[str],
         since: str = DEFAULT_HISTORY_START,
         use_cache: bool = True,
+        sigma_window: int | None = None,
     ) -> List[Dict[str, Any]]:
         """
         Resolve and fetch **consistent** multi-source data for every
@@ -1206,6 +1259,7 @@ class ChartmetricClient:
             try:
                 data = self.get_artist_scan_data(
                     cm_id, name, since=since, use_cache=use_cache,
+                    sigma_window=sigma_window,
                 )
             except ChartmetricAPIError as exc:
                 logger.warning(

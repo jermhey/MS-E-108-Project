@@ -374,6 +374,8 @@ class OUArtistInput:
     listeners: float            # current Spotify monthly listeners (spot)
     sigma: float                # annualised percentage volatility (e.g. 1.55)
     norm_velocity: float = 0.0  # TikTok velocity normalised to [0, 1]
+    trend: float = 0.0          # annualised absolute drift (listeners/year)
+                                # computed from recent growth + leading indicators
 
 
 @dataclass
@@ -428,11 +430,93 @@ class MonteCarloOU:
         self.n_paths = n_paths
         self.seed = seed
 
+    # ── Analytical contention filter ────────────────────────────────
+    # Before the expensive MC simulation, use the OU model's own
+    # closed-form solution to pre-screen artists.  If an artist has
+    # negligible analytical probability of beating the leader 1-on-1,
+    # their paths are made deterministic (sigma → 0) so probability
+    # naturally concentrates on real contenders.
+    #
+    # For OU process starting at X_0 with long-term mean mu:
+    #   E[X(T)]   = mu + (X_0 - mu) * exp(-theta*T)
+    #   Var[X(T)] = sigma_abs^2 / (2*theta) * (1 - exp(-2*theta*T))
+    #
+    # P(artist_i beats leader) = Φ( E[D] / sqrt(Var_i + Var_leader) )
+    # where D = X_i(T) - X_leader(T).
+    #
+    # This is fully data-driven — no manual tuning parameters beyond
+    # the natural threshold min_contention_prob (default 0.1%).
+
+    @staticmethod
+    def _analytical_contention_mask(
+        spots: np.ndarray,
+        mu: np.ndarray,
+        sigma_abs: np.ndarray,
+        theta: float,
+        T: float,
+        trends: np.ndarray | None = None,
+        min_prob: float = 0.001,
+    ) -> np.ndarray:
+        """
+        Return a boolean mask: True = contender, False = out of contention.
+
+        Uses the OU closed-form to compute each artist's pairwise
+        probability of beating the current leader at time T, accounting
+        for both volatility AND trend (momentum drift).
+
+        Parameters
+        ----------
+        trends : array or None
+            Per-artist annualised absolute drift (listeners/year).
+            Included in the expected value at T so that a fast-growing
+            artist isn't filtered out prematurely.
+        min_prob : float
+            Minimum analytical P(beats leader) to remain a contender.
+            0.001 (0.1%) is a conservative default — only filters
+            artists with essentially zero chance.
+        """
+        n = len(spots)
+        if trends is None:
+            trends = np.zeros(n)
+
+        # Leader = artist with highest EXPECTED value at T
+        # (not just highest current spot — a surging underdog may
+        # have the highest expected value despite a lower spot)
+        exp_theta_T = math.exp(-theta * T)
+        exp_2theta_T = math.exp(-2 * theta * T)
+
+        # OU expected values at T (with trend drift)
+        # For trending OU: E[X(T)] ≈ OU_expectation + trend * T
+        E_T = mu + (spots - mu) * exp_theta_T + trends * T
+
+        # OU variances at T (avoid division by zero if theta ≈ 0)
+        if theta > 1e-8:
+            var_coeff = (1.0 - exp_2theta_T) / (2.0 * theta)
+        else:
+            var_coeff = T  # degenerate case: pure diffusion
+        Var_T = sigma_abs ** 2 * var_coeff
+
+        # Leader by expected value at T
+        leader_idx = int(np.argmax(E_T))
+
+        mask = np.ones(n, dtype=bool)
+        for i in range(n):
+            if i == leader_idx:
+                continue
+            mean_diff = E_T[i] - E_T[leader_idx]
+            std_diff = math.sqrt(max(Var_T[i] + Var_T[leader_idx], 1e-20))
+            p_beat = float(norm.cdf(mean_diff / std_diff))
+            if p_beat < min_prob:
+                mask[i] = False
+
+        return mask
+
     def simulate_wta(
         self,
         artists: list[OUArtistInput],
         T: float,
         jump_beta: float = 0.0,
+        min_contention_prob: float = 0.001,
     ) -> list[OUArtistResult]:
         """
         Run the full WTA Monte Carlo simulation.
@@ -446,6 +530,14 @@ class MonteCarloOU:
         jump_beta : float
             TikTok → listener lagged correlation.  Shifts the
             long-term mean upward for viral artists.
+        min_contention_prob : float
+            Minimum analytical P(beats leader) for an artist to remain
+            in contention.  Artists below this threshold get
+            deterministic paths (sigma → 0), so their probability
+            naturally flows to real contenders.
+            Set to 0 to disable (all artists keep full sigma).
+            Default 0.001 (0.1%) — conservative, only prunes artists
+            with essentially no chance.
 
         Returns
         -------
@@ -470,6 +562,9 @@ class MonteCarloOU:
         velocities = np.array(
             [a.norm_velocity for a in artists], dtype=np.float64,
         )
+        trends = np.array(
+            [a.trend for a in artists], dtype=np.float64,
+        )
 
         # Long-term mean: current spot adjusted for TikTok momentum
         mu = spots * (1.0 + jump_beta * velocities)
@@ -478,15 +573,41 @@ class MonteCarloOU:
         # sigma_abs = annualised_pct_vol * spot
         sigma_abs = sigmas_pct * spots
 
+        # ── Analytical contention filter ─────────────────────────────
+        # Use the model's own closed-form OU solution to identify
+        # artists with negligible chance of winning.  Their sigma is
+        # zeroed → deterministic paths → probability concentrates on
+        # real contenders.  Fully data-driven, no manual tuning.
+        # The filter accounts for both volatility AND trend.
+        if min_contention_prob > 0:
+            contender_mask = self._analytical_contention_mask(
+                spots, mu, sigma_abs, self.theta, T, trends,
+                min_prob=min_contention_prob,
+            )
+            n_contenders = int(contender_mask.sum())
+            # Zero out sigma AND trend for non-contenders
+            sigma_abs = np.where(contender_mask, sigma_abs, 0.0)
+            trends = np.where(contender_mask, trends, 0.0)
+        else:
+            n_contenders = n_artists
+
         # ── Initialise paths: shape (n_paths, n_artists) ─────────────
         X = np.tile(spots, (self.n_paths, 1))
 
-        # ── Simulate ─────────────────────────────────────────────────
+        # ── Simulate (trending OU process) ───────────────────────────
+        # dX = theta*(mu - X)*dt + trend*dt + sigma_abs*sqrt(dt)*dW
+        #
+        # The trend term adds an independent directional drift on top
+        # of mean-reversion.  This is critical: theta is slow (~0.055)
+        # so mu-adjustment alone barely moves the needle over 12 days.
+        # The trend directly encodes observed momentum (listener growth,
+        # TikTok virality) as a per-artist drift rate.
         for _ in range(n_steps):
             Z = rng.standard_normal((self.n_paths, n_artists))
-            drift = self.theta * (mu - X) * dt
+            drift_mr = self.theta * (mu - X) * dt
+            drift_momentum = trends * dt
             diffusion = sigma_abs * sqrt_dt * Z
-            X = X + drift + diffusion
+            X = X + drift_mr + drift_momentum + diffusion
             np.maximum(X, 0, out=X)  # listeners can't go negative
 
         # ── Count wins ───────────────────────────────────────────────
