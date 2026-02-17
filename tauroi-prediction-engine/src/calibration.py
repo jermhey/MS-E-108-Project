@@ -112,29 +112,25 @@ class Calibrator:
 
     # ── sigma: base volatility ──────────────────────────────────────────
 
+    # Minimum credible annualised volatility.  Prevents sigma from
+    # collapsing to near-zero on ultra-stable artists, which would make
+    # the OU simulation deterministic.  5% is a conservative floor —
+    # even the stickiest superstar has ≥ 5% annualised listener churn.
+    _SIGMA_FLOOR: float = 0.05
+
     def compute_sigma(self, window: int = 7) -> float:
         """
         Realized Volatility (sigma).
 
-        Computes annualised volatility via two independent estimators and
-        takes the **maximum** — the more conservative (wider distribution)
-        estimate is always safer for a pricing model.
+        Uses the **sample standard deviation of daily returns**, annualised.
+        This is the textbook realized-vol estimator.
 
-        **Estimator 1 — Sample Std of Returns:**
-            Standard deviation of ALL daily percent-changes, annualised.
-            This is the textbook realized-vol estimator and naturally
-            captures fat tails (e.g. the +7.9% single-day jump on Feb 10).
+        The old "range-implied floor" (max-min / min / sqrt(N)) is logged
+        for reference but **no longer used** — over multi-year history the
+        min-to-max range reflects structural growth, not short-term vol,
+        and inflates sigma by 10x+.
 
-        **Estimator 2 — Range-Implied Vol Floor:**
-            ``(max - min) / min / sqrt(N_days)`` annualised.
-            If the price moved 23% over 91 days, vol cannot be lower than
-            what that range implies.  Acts as a floor to prevent the model
-            from ever producing "0% probability" for moves that clearly
-            happen in the data.
-
-        The old method (mean of 7-day rolling stds) is logged for reference
-        but no longer used as the primary estimator — it averages away the
-        tails that matter most for jump-diffusion pricing.
+        A modest absolute floor of 5% prevents degenerate simulations.
         """
         listeners = self.df["spotify_monthly_listeners"].astype(float)
         pct_change = listeners.pct_change().dropna()
@@ -143,11 +139,11 @@ class Calibrator:
             logger.warning("Not enough data to compute sigma")
             return 0.20  # sensible fallback
 
-        # ── Estimator 1: Sample std of all daily returns ─────────────
+        # ── Primary: Sample std of all daily returns ─────────────────
         sigma_daily_sample = float(pct_change.std())
         sigma_sample = sigma_daily_sample * math.sqrt(365)
 
-        # ── Estimator 2: Range-implied vol floor ─────────────────────
+        # ── Reference only: Range-implied (logged, NOT used) ─────────
         price_min = float(listeners.min())
         price_max = float(listeners.max())
         n_days = max(len(listeners) - 1, 1)
@@ -159,20 +155,13 @@ class Calibrator:
         else:
             sigma_range = 0.0
 
-        # ── Old method (logged for comparison) ───────────────────────
-        rolling_std = pct_change.rolling(window=window).std().dropna()
-        sigma_rolling_mean = (
-            float(rolling_std.mean()) * math.sqrt(365)
-            if not rolling_std.empty else 0.0
-        )
-
-        # ── Take the max ─────────────────────────────────────────────
-        sigma_annual = max(sigma_sample, sigma_range)
+        # ── Apply floor ──────────────────────────────────────────────
+        sigma_annual = max(sigma_sample, self._SIGMA_FLOOR)
 
         logger.info(
-            "sigma estimators — sample=%.4f | range_floor=%.4f | "
-            "rolling_mean=%.4f (old) → using %.4f",
-            sigma_sample, sigma_range, sigma_rolling_mean, sigma_annual,
+            "sigma estimators — sample=%.4f | range=%.4f (ref only) "
+            "| floor=%.4f → using %.4f",
+            sigma_sample, sigma_range, self._SIGMA_FLOOR, sigma_annual,
         )
         return sigma_annual
 
