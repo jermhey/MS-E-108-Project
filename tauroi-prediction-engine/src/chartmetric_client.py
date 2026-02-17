@@ -89,6 +89,14 @@ class ChartmetricClient:
         self._artist_id = self._settings.chartmetric_artist_id
         self._timeout = timeout
         self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36 "
+                "TauroiPredictionEngine/1.0"
+            ),
+        })
 
         # Cache state
         self._cache_dir = _CACHE_DIR
@@ -173,16 +181,28 @@ class ChartmetricClient:
                 logger.info("Retry %d/%d — waiting %ds...", attempt, retries, backoff)
                 time.sleep(backoff)
 
-            resp = self._session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                timeout=self._timeout,
-            )
+            try:
+                resp = self._session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    timeout=self._timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)[:500]
+                logger.error(
+                    "[API ERROR] Network failure on %s %s (attempt %d/%d): %s",
+                    method, path, attempt + 1, retries + 1, last_error,
+                )
+                continue
 
             if resp.status_code == 401:
-                logger.warning("401 received — refreshing token and retrying")
+                logger.warning(
+                    "[API ERROR] 401 Unauthorized on %s %s — "
+                    "refreshing token and retrying. Body: %s",
+                    method, path, resp.text[:500],
+                )
                 self._refresh_access_token()
                 headers["Authorization"] = f"Bearer {self._access_token}"
                 continue
@@ -195,28 +215,45 @@ class ChartmetricClient:
                 except (ValueError, TypeError):
                     retry_after = 60
 
+                logger.warning(
+                    "[API ERROR] 429 Rate Limited on %s %s — "
+                    "Retry-After: %ds | Body: %s",
+                    method, path, retry_after, resp.text[:500],
+                )
+
                 if retry_after > 120:
                     raise ChartmetricAPIError(
                         f"Rate limited (429) with {retry_after}s backoff — "
                         f"aborting {method} {path}. Try again later or use cache."
                     )
 
-                logger.warning("Rate limited (429) — sleeping %ds", retry_after)
                 time.sleep(retry_after)
                 continue
 
             if resp.status_code >= 500:
-                last_error = resp.text[:300]
-                logger.warning(
-                    "Server error %d on %s %s (attempt %d/%d)",
+                last_error = resp.text[:500]
+                logger.error(
+                    "[API ERROR] Server %d on %s %s (attempt %d/%d)\n"
+                    "  Body: %s\n"
+                    "  Headers: %s",
                     resp.status_code, method, path, attempt + 1, retries + 1,
+                    last_error,
+                    dict(resp.headers),
                 )
                 continue
 
             if not resp.ok:
+                logger.error(
+                    "[API ERROR] Client %d on %s %s\n"
+                    "  Body: %s\n"
+                    "  Params: %s",
+                    resp.status_code, method, path,
+                    resp.text[:500],
+                    params,
+                )
                 raise ChartmetricAPIError(
                     f"Chartmetric API error {resp.status_code} "
-                    f"for {method} {path}: {resp.text[:300]}"
+                    f"for {method} {path}: {resp.text[:500]}"
                 )
 
             return resp.json()
@@ -1032,7 +1069,9 @@ class ChartmetricClient:
     # automatically capture event risk (album drops, viral moments)
     # without including multi-year structural growth.
     _SIGMA_WINDOWS = [90, 180, 365]
-    _SIGMA_FLOOR = 0.05  # minimum credible annualised vol
+    _SIGMA_FLOOR = 0.05   # minimum credible annualised vol
+    _SIGMA_CAP = 1.00     # maximum credible annualised vol (100%)
+                          # anything above is data corruption, not real volatility
 
     def _build_scan_result(
         self,
@@ -1088,6 +1127,7 @@ class ChartmetricClient:
                     best_sigma = s
 
         sigma = max(best_sigma, self._SIGMA_FLOOR)
+        sigma = min(sigma, self._SIGMA_CAP)  # guard against data corruption
 
         # ── Latest values (from the last row of the merged DF) ───────
         latest = merged.iloc[-1]

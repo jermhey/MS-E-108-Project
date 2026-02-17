@@ -136,8 +136,8 @@ class Calibrator:
         pct_change = listeners.pct_change().dropna()
 
         if pct_change.empty:
-            logger.warning("Not enough data to compute sigma")
-            return 0.20  # sensible fallback
+            logger.warning("Not enough data to compute sigma — using conservative floor")
+            return self._SIGMA_FLOOR  # 0.05: assume stable, not chaotic
 
         # ── Primary: Sample std of all daily returns ─────────────────
         sigma_daily_sample = float(pct_change.std())

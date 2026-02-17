@@ -43,7 +43,7 @@ class ModelParams:
 
     risk_free_rate: float = 0.05        # r  — annualised risk-free rate
     time_to_expiry: float = 1 / 365     # T  — default 1 day (fraction of year)
-    sigma_base: float = 0.20            # base annualised vol of listener churn
+    sigma_base: float = 0.05            # base annualised vol of listener churn (conservative)
     jump_threshold: float = 0.80        # TikTok velocity that triggers jump
     jump_multiplier: float = 3.0        # vol multiplier under jump regime
     correlation_factor: float = 3_000_000  # maps velocity to listener delta
