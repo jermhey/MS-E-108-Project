@@ -740,6 +740,239 @@ class KalshiClient:
         )
         return results
 
+    # ═════════════════════════════════════════════════════════════════════
+    #  Portfolio & Trading
+    # ═════════════════════════════════════════════════════════════════════
+
+    def get_balance(self) -> Dict[str, Any]:
+        """
+        Fetch the account balance.
+
+        Endpoint: GET /portfolio/balance
+
+        Returns dict with ``balance`` (cents), ``portfolio_value`` (cents),
+        and other balance fields.
+        """
+        data = self._request("GET", "/portfolio/balance")
+        logger.info(
+            "Balance: %s cents available",
+            data.get("balance", "?"),
+        )
+        return data
+
+    def get_positions(
+        self,
+        ticker: str | None = None,
+        settlement_status: str | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[Dict[str, Any]], str | None]:
+        """
+        Fetch open positions.
+
+        Endpoint: GET /portfolio/positions
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if settlement_status:
+            params["settlement_status"] = settlement_status
+        if cursor:
+            params["cursor"] = cursor
+
+        data = self._request("GET", "/portfolio/positions", params=params)
+        positions = data.get("market_positions", [])
+        next_cursor = data.get("cursor", None)
+        logger.info("Fetched %d positions", len(positions))
+        return positions, next_cursor
+
+    def get_all_positions(self) -> list[Dict[str, Any]]:
+        """Paginate through all open (unsettled) positions."""
+        all_pos: list[Dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(50):
+            batch, cursor = self.get_positions(
+                settlement_status="unsettled", cursor=cursor,
+            )
+            all_pos.extend(batch)
+            if not cursor or not batch:
+                break
+        return all_pos
+
+    def get_orders(
+        self,
+        ticker: str | None = None,
+        status: str = "resting",
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[Dict[str, Any]], str | None]:
+        """
+        Fetch orders (default: resting/open).
+
+        Endpoint: GET /portfolio/orders
+        """
+        params: Dict[str, Any] = {"limit": limit, "status": status}
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+
+        data = self._request("GET", "/portfolio/orders", params=params)
+        orders = data.get("orders", [])
+        next_cursor = data.get("cursor", None)
+        logger.info("Fetched %d orders (status=%s)", len(orders), status)
+        return orders, next_cursor
+
+    def get_all_resting_orders(self) -> list[Dict[str, Any]]:
+        """Paginate through all resting orders."""
+        all_orders: list[Dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(50):
+            batch, cursor = self.get_orders(status="resting", cursor=cursor)
+            all_orders.extend(batch)
+            if not cursor or not batch:
+                break
+        return all_orders
+
+    def get_orderbook(self, ticker: str) -> Dict[str, Any]:
+        """
+        Fetch the order book for a market.
+
+        Endpoint: GET /markets/{ticker}/orderbook
+
+        Returns dict with ``yes`` and ``no`` arrays of [price, quantity] pairs.
+        """
+        data = self._request("GET", f"/markets/{ticker}/orderbook")
+        ob = data.get("orderbook", data)
+        logger.debug("Orderbook for %s: %s", ticker, ob)
+        return ob
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price_cents: int,
+        *,
+        client_order_id: str | None = None,
+        post_only: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Place a limit order.
+
+        Parameters
+        ----------
+        ticker : str
+            Market ticker (e.g. ``KXTOPMONTHLY-26FEB-BAD``).
+        side : str
+            ``"yes"`` or ``"no"``.
+        action : str
+            ``"buy"`` or ``"sell"``.
+        count : int
+            Number of contracts (≥ 1).
+        price_cents : int
+            Limit price in cents (1–99).
+        client_order_id : str, optional
+            Unique idempotency key (UUID recommended).
+        post_only : bool
+            If True (default), order will only rest on the book
+            (maker fee). If it would cross, it is rejected.
+
+        Returns
+        -------
+        dict
+            The created order object from Kalshi.
+        """
+        import uuid as _uuid
+
+        if side not in ("yes", "no"):
+            raise ValueError(f"side must be 'yes' or 'no', got '{side}'")
+        if action not in ("buy", "sell"):
+            raise ValueError(f"action must be 'buy' or 'sell', got '{action}'")
+        if not 1 <= price_cents <= 99:
+            raise ValueError(f"price_cents must be 1–99, got {price_cents}")
+        if count < 1:
+            raise ValueError(f"count must be ≥ 1, got {count}")
+
+        body: Dict[str, Any] = {
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "count": count,
+            "type": "limit",
+            "yes_price": price_cents if side == "yes" else (100 - price_cents),
+            "client_order_id": client_order_id or str(_uuid.uuid4()),
+        }
+        if post_only:
+            body["post_only"] = True
+
+        data = self._request("POST", "/portfolio/orders", json_body=body)
+        order = data.get("order", data)
+
+        logger.info(
+            "ORDER PLACED: %s %s %s ×%d @%dc | id=%s | status=%s",
+            action.upper(), side.upper(), ticker, count, price_cents,
+            order.get("order_id", "?"), order.get("status", "?"),
+        )
+        return order
+
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """
+        Cancel a resting order.
+
+        Endpoint: DELETE /portfolio/orders/{order_id}
+        """
+        data = self._request("DELETE", f"/portfolio/orders/{order_id}")
+        logger.info("ORDER CANCELLED: %s", order_id)
+        return data
+
+    def cancel_all_orders(self) -> int:
+        """Cancel all resting orders. Returns the number cancelled."""
+        orders = self.get_all_resting_orders()
+        cancelled = 0
+        for o in orders:
+            oid = o.get("order_id")
+            if oid:
+                try:
+                    self.cancel_order(oid)
+                    cancelled += 1
+                except KalshiAPIError as exc:
+                    logger.warning("Failed to cancel %s: %s", oid, exc)
+        logger.info("Cancelled %d/%d resting orders", cancelled, len(orders))
+        return cancelled
+
+    def amend_order(
+        self,
+        order_id: str,
+        *,
+        new_price_cents: int | None = None,
+        new_count: int | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Amend a resting order's price and/or count.
+
+        Endpoint: POST /portfolio/orders/{order_id}/amend
+        """
+        body: Dict[str, Any] = {}
+        if new_price_cents is not None:
+            body["price"] = new_price_cents
+        if new_count is not None:
+            body["count"] = new_count
+
+        if not body:
+            raise ValueError("Must specify new_price_cents and/or new_count")
+
+        data = self._request(
+            "POST", f"/portfolio/orders/{order_id}/amend",
+            json_body=body,
+        )
+        logger.info(
+            "ORDER AMENDED: %s → price=%s count=%s",
+            order_id, new_price_cents, new_count,
+        )
+        return data
+
     @property
     def is_authenticated(self) -> bool:
         return self._authenticated

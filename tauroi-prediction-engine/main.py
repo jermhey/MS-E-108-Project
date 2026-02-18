@@ -669,8 +669,6 @@ def run_real_strategy(
 
     if dry_run:
         logger.info("DRY-RUN complete — no orders placed.")
-    else:
-        logger.info("LIVE mode — order execution would happen here.")
 
     print()
 
@@ -1024,6 +1022,9 @@ def run(
     artist_id: str | None = None,
     no_cache: bool = False,
     analyze_alpha: bool = False,
+    live: bool = False,
+    max_order_size: int = 25,
+    max_daily_loss: float = 0.10,
 ) -> None:
     """
     Full pipeline: fetch API data -> calibrate -> market -> strategy.
@@ -1048,6 +1049,12 @@ def run(
         If True, skip the local Parquet cache and force a full API fetch.
     analyze_alpha : bool
         If True, run Lead-Lag Alpha Analysis after market discovery.
+    live : bool
+        If True, execute real orders on Kalshi via the OrderExecutor.
+    max_order_size : int
+        Max contracts per order (risk parameter).
+    max_daily_loss : float
+        Max daily loss as fraction of balance (risk parameter).
     """
     global ARTIST_NAME
 
@@ -1106,6 +1113,10 @@ def run(
     if scan:
         return _run_scan_pipeline(
             cm_client, cal, market_result, df, dry_run, no_cache,
+            live=live,
+            settings=settings,
+            max_order_size=max_order_size,
+            max_daily_loss=max_daily_loss,
         )
     else:
         return _run_single_artist_pipeline(
@@ -1229,6 +1240,10 @@ def _run_scan_pipeline(
     df: pd.DataFrame,
     dry_run: bool,
     no_cache: bool = False,
+    live: bool = False,
+    settings: Settings | None = None,
+    max_order_size: int = 25,
+    max_daily_loss: float = 0.10,
 ) -> list[Dict[str, Any]]:
     """
     **Data-first** market scan.
@@ -1245,6 +1260,7 @@ def _run_scan_pipeline(
     2.  For each artist, fetches full history (since 2019) from Chartmetric.
     3.  Runs MC-OU on the Chartmetric-derived field.
     4.  Overlays Kalshi prices for edge calculation.
+    5.  (Live mode) Sends actionable signals through the executor.
 
     The model independently discovers the competitive landscape BEFORE
     looking at any Kalshi prices.
@@ -1305,7 +1321,77 @@ def _run_scan_pipeline(
         dry_run=dry_run,
     )
 
+    # ── Live execution ─────────────────────────────────────────────
+    if live and scan_results:
+        _execute_scan_signals(
+            scan_results, settings, max_order_size, max_daily_loss,
+        )
+    elif dry_run:
+        logger.info("DRY-RUN scan complete — no orders placed.")
+
     return scan_results
+
+
+def _execute_scan_signals(
+    scan_rows: list[Dict[str, Any]],
+    settings: Settings | None,
+    max_order_size: int,
+    max_daily_loss: float,
+) -> None:
+    """Send scan signals through the live execution pipeline."""
+    from src.kalshi_client import KalshiClient
+    from src.executor import OrderExecutor
+    from src.risk_manager import RiskManager
+    from src.position_store import PositionStore
+
+    if settings is None:
+        settings = load_settings(require_secrets=True)
+
+    kalshi = KalshiClient(settings=settings)
+    store = PositionStore()
+    risk = RiskManager(
+        max_order_size=max_order_size,
+        max_daily_loss_pct=max_daily_loss,
+    )
+    executor = OrderExecutor(kalshi, risk, store)
+
+    # Initialise: fetch balance, reconcile positions
+    startup_info = executor.startup()
+
+    print()
+    print("  " + "=" * 60)
+    print("  LIVE EXECUTION ENGINE")
+    print("  " + "=" * 60)
+    print(f"  Balance:         ${startup_info['balance_dollars']:.2f}")
+    print(f"  Open positions:  {startup_info['open_positions']}")
+    print(f"  Resting orders:  {startup_info['resting_orders']}")
+    print(f"  Max order size:  {risk.max_order_size} contracts")
+    print(f"  Max daily loss:  {risk.max_daily_loss_pct:.0%}")
+    print("  " + "-" * 60)
+
+    results = executor.process_scan_signals(
+        scan_rows, edge_threshold=EDGE_THRESHOLD,
+    )
+
+    # Summary
+    placed = [r for r in results if r["status"] == "placed"]
+    rejected = [r for r in results if r["status"] == "rejected"]
+    errors = [r for r in results if r["status"] == "error"]
+
+    print()
+    print(f"  Orders placed:   {len(placed)}")
+    print(f"  Risk rejected:   {len(rejected)}")
+    print(f"  Errors:          {len(errors)}")
+
+    for r in placed:
+        print(f"    + {r['action']} {r['ticker']} — {r['reason']}")
+    for r in rejected:
+        print(f"    - {r['ticker']} REJECTED: {r['reason']}")
+    for r in errors:
+        print(f"    ! {r['ticker']} ERROR: {r['reason']}")
+
+    print("  " + "=" * 60)
+    print()
 
 
 def _run_single_artist_pipeline(
@@ -1361,13 +1447,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         default=False,
-        help="Log signals without placing orders.",
+        help="Log signals without placing orders (DEFAULT behaviour).",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help="LIVE TRADING: place real orders on Kalshi. Requires --scan.",
+    )
+    parser.add_argument(
+        "--kill",
+        action="store_true",
+        default=False,
+        help="EMERGENCY: cancel all orders and close all positions, then exit.",
     )
     parser.add_argument(
         "--data-only",
         action="store_true",
         default=False,
         help="Only run data loading + calibration (no Kalshi / strategy).",
+    )
+
+    # ── Risk overrides (for --live mode) ─────────────────────────────
+    parser.add_argument(
+        "--max-order-size",
+        type=int,
+        default=25,
+        help="Max contracts per order (default: 25).",
+    )
+    parser.add_argument(
+        "--max-daily-loss",
+        type=float,
+        default=0.10,
+        help="Max daily loss as fraction of balance (default: 0.10 = 10%%).",
     )
 
     # ── Artist overrides ─────────────────────────────────────────────
@@ -1451,11 +1563,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    # ── Kill switch: emergency shutdown, then exit ────────────────
+    if args.kill:
+        _handle_kill_switch()
+        return
+
+    # ── Live mode validation ──────────────────────────────────────
+    live = args.live and not args.dry_run
+    if live and not args.scan:
+        print("\n  ERROR: --live requires --scan (live trading only works with full market scans)")
+        sys.exit(1)
+
+    if live:
+        print()
+        print("  " + "!" * 60)
+        print("  !  LIVE TRADING MODE                                     !")
+        print("  !  Real orders will be placed on Kalshi.                 !")
+        print("  !  Press Ctrl+C within 5 seconds to abort.              !")
+        print("  " + "!" * 60)
+        print()
+        try:
+            for i in range(5, 0, -1):
+                print(f"  Starting in {i}...", flush=True)
+                _time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n  Aborted. No orders placed.")
+            return
+        print()
+
     def _single_run() -> None:
         """Execute one full pipeline cycle with top-level error handling."""
         try:
             run(
-                dry_run=args.dry_run,
+                dry_run=not live,
                 data_only=args.data_only,
                 scan=args.scan,
                 strike=args.strike,
@@ -1464,6 +1604,9 @@ def main(argv: list[str] | None = None) -> None:
                 artist_id=args.artist_id,
                 no_cache=args.no_cache,
                 analyze_alpha=args.analyze_alpha,
+                live=live,
+                max_order_size=args.max_order_size,
+                max_daily_loss=args.max_daily_loss,
             )
         except KeyboardInterrupt:
             raise
@@ -1490,6 +1633,38 @@ def main(argv: list[str] | None = None) -> None:
             _time.sleep(args.interval)
     else:
         _single_run()
+
+
+def _handle_kill_switch() -> None:
+    """Emergency shutdown: cancel all orders and close all positions."""
+    from src.kalshi_client import KalshiClient
+    from src.executor import OrderExecutor
+    from src.risk_manager import RiskManager
+    from src.position_store import PositionStore
+
+    print()
+    print("  " + "!" * 60)
+    print("  !  KILL SWITCH ACTIVATED                                 !")
+    print("  !  Cancelling all orders and closing all positions...    !")
+    print("  " + "!" * 60)
+    print()
+
+    settings = load_settings(require_secrets=True)
+    kalshi = KalshiClient(settings=settings)
+    store = PositionStore()
+    risk = RiskManager()
+    executor = OrderExecutor(kalshi, risk, store)
+
+    summary = executor.kill_all()
+
+    print(f"  Orders cancelled: {summary['orders_cancelled']}")
+    print(f"  Positions closed: {summary['positions_closed']}")
+    if summary["errors"]:
+        print(f"  Errors: {len(summary['errors'])}")
+        for err in summary["errors"]:
+            print(f"    - {err}")
+    print()
+    print("  Kill switch complete.")
 
 
 if __name__ == "__main__":
