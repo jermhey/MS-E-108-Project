@@ -43,7 +43,7 @@ class ModelParams:
 
     risk_free_rate: float = 0.05        # r  — annualised risk-free rate
     time_to_expiry: float = 1 / 365     # T  — default 1 day (fraction of year)
-    sigma_base: float = 0.05            # base annualised vol of listener churn (conservative)
+    sigma_base: float = 0.20            # base annualised vol of listener churn
     jump_threshold: float = 0.80        # TikTok velocity that triggers jump
     jump_multiplier: float = 3.0        # vol multiplier under jump regime
     correlation_factor: float = 3_000_000  # maps velocity to listener delta
@@ -374,8 +374,11 @@ class OUArtistInput:
     listeners: float            # current Spotify monthly listeners (spot)
     sigma: float                # annualised percentage volatility (e.g. 1.55)
     norm_velocity: float = 0.0  # TikTok velocity normalised to [0, 1]
-    trend: float = 0.0          # annualised absolute drift (listeners/year)
-                                # computed from recent growth + leading indicators
+    jump_intensity: float | None = None  # per-artist Poisson rate (None = global)
+    jump_std: float | None = None        # per-artist log-normal std (None = global)
+    event_impact_score: float = 1.0      # scales jump params (1.0=quiet, 3.0=album)
+    trend: float = 0.0         # annualised growth rate from recent history (EWMA)
+    momentum: float = 0.0      # composite cross-platform momentum score [-1, 1]
 
 
 @dataclass
@@ -394,150 +397,105 @@ class OUArtistResult:
 
 class MonteCarloOU:
     """
-    Ornstein-Uhlenbeck Monte Carlo simulator for Winner-Take-All markets.
+    Ornstein-Uhlenbeck Monte Carlo simulator for Winner-Take-All markets,
+    extended with **Merton-style jump diffusion** and **Laplace smoothing**.
 
     Simulates **all** artists simultaneously.  At expiry, the artist with
-    the most listeners wins.  The win count across paths IS the probability
-    — no normalization hack needed.
+    the most listeners wins.
 
-    The OU process keeps listener counts "sticky":
+    The OU-Jump process:
 
-        X_{t+dt} = X_t + theta * (mu_i - X_t) * dt + sigma_abs_i * sqrt(dt) * Z
+        dX = theta * (mu - X) * dt + sigma_abs * dW + X * J * dN
 
     where:
-        theta     — mean-reversion speed (higher = stickier)
-        mu_i      — long-term mean, = spot * (1 + beta * velocity)
-        sigma_abs — absolute vol = sigma_pct * spot
+        theta      — mean-reversion speed (higher = stickier)
+        mu_i       — long-term mean, = spot * (1 + beta * velocity)
+        sigma_abs  — absolute vol = sigma_pct * X (level-proportional)
+        dN         — Poisson jump arrival (intensity = jump_intensity)
+        J          — log-normal jump size (mean 0, std = jump_std)
+
+    The jump component models discrete shocks (album drops, viral events,
+    playlist additions) that the continuous diffusion cannot capture.
+    Without jumps, artists far behind the leader get exactly 0% —
+    mathematically correct but ignores tail risk.
+
+    **Laplace smoothing** applies a Bayesian pseudocount to prevent any
+    artist from receiving exactly 0% or 100%, reflecting genuine model
+    uncertainty.
 
     Parameters
     ----------
     theta : float
         Annualised mean-reversion speed.  0.1 = slow pull.
-        Calibrated from lag-1 autocorrelation if available.
     n_paths : int
         Number of Monte Carlo paths (default 10,000).
     seed : int or None
         Random seed for reproducibility.
+    jump_intensity : float
+        Annualised Poisson arrival rate for jumps (default 12.0 =
+        ~1 jump per month per artist).  Set to 0 to disable jumps.
+    jump_std : float
+        Log-normal standard deviation of jump sizes (default 0.04 =
+        typical jump of ±4-8% of current level).
+    laplace_alpha : float
+        Pseudocount for Laplace smoothing (default 25).  Each artist
+        gets ``alpha`` phantom wins added, ensuring a probability
+        floor of roughly ``alpha / (n_paths + n_artists * alpha)``.
+        Set to 0 to disable smoothing.
     """
 
     def __init__(
         self,
         theta: float = 0.1,
         n_paths: int = 10_000,
-        seed: int | None = 42,
+        seed: int | None = None,
+        jump_intensity: float = 12.0,
+        jump_std: float = 0.04,
+        laplace_alpha: float = 25.0,
     ) -> None:
         self.theta = theta
         self.n_paths = n_paths
         self.seed = seed
-
-    # ── Analytical contention filter ────────────────────────────────
-    # Before the expensive MC simulation, use the OU model's own
-    # closed-form solution to pre-screen artists.  If an artist has
-    # negligible analytical probability of beating the leader 1-on-1,
-    # their paths are made deterministic (sigma → 0) so probability
-    # naturally concentrates on real contenders.
-    #
-    # For OU process starting at X_0 with long-term mean mu:
-    #   E[X(T)]   = mu + (X_0 - mu) * exp(-theta*T)
-    #   Var[X(T)] = sigma_abs^2 / (2*theta) * (1 - exp(-2*theta*T))
-    #
-    # P(artist_i beats leader) = Φ( E[D] / sqrt(Var_i + Var_leader) )
-    # where D = X_i(T) - X_leader(T).
-    #
-    # This is fully data-driven — no manual tuning parameters beyond
-    # the natural threshold min_contention_prob (default 0.1%).
-
-    @staticmethod
-    def _analytical_contention_mask(
-        spots: np.ndarray,
-        mu: np.ndarray,
-        sigma_abs: np.ndarray,
-        theta: float,
-        T: float,
-        trends: np.ndarray | None = None,
-        min_prob: float = 0.001,
-    ) -> np.ndarray:
-        """
-        Return a boolean mask: True = contender, False = out of contention.
-
-        Uses the OU closed-form to compute each artist's pairwise
-        probability of beating the current leader at time T, accounting
-        for both volatility AND trend (momentum drift).
-
-        Parameters
-        ----------
-        trends : array or None
-            Per-artist annualised absolute drift (listeners/year).
-            Included in the expected value at T so that a fast-growing
-            artist isn't filtered out prematurely.
-        min_prob : float
-            Minimum analytical P(beats leader) to remain a contender.
-            0.001 (0.1%) is a conservative default — only filters
-            artists with essentially zero chance.
-        """
-        n = len(spots)
-        if trends is None:
-            trends = np.zeros(n)
-
-        # Leader = artist with highest EXPECTED value at T
-        # (not just highest current spot — a surging underdog may
-        # have the highest expected value despite a lower spot)
-        exp_theta_T = math.exp(-theta * T)
-        exp_2theta_T = math.exp(-2 * theta * T)
-
-        # OU expected values at T (with trend drift)
-        # For trending OU: E[X(T)] ≈ OU_expectation + trend * T
-        E_T = mu + (spots - mu) * exp_theta_T + trends * T
-
-        # OU variances at T (avoid division by zero if theta ≈ 0)
-        if theta > 1e-8:
-            var_coeff = (1.0 - exp_2theta_T) / (2.0 * theta)
-        else:
-            var_coeff = T  # degenerate case: pure diffusion
-        Var_T = sigma_abs ** 2 * var_coeff
-
-        # Leader by expected value at T
-        leader_idx = int(np.argmax(E_T))
-
-        mask = np.ones(n, dtype=bool)
-        for i in range(n):
-            if i == leader_idx:
-                continue
-            mean_diff = E_T[i] - E_T[leader_idx]
-            std_diff = math.sqrt(max(Var_T[i] + Var_T[leader_idx], 1e-20))
-            p_beat = float(norm.cdf(mean_diff / std_diff))
-            if p_beat < min_prob:
-                mask[i] = False
-
-        return mask
+        self.jump_intensity = jump_intensity
+        self.jump_std = jump_std
+        self.laplace_alpha = laplace_alpha
 
     def simulate_wta(
         self,
         artists: list[OUArtistInput],
         T: float,
         jump_beta: float = 0.0,
-        min_contention_prob: float = 0.001,
     ) -> list[OUArtistResult]:
         """
-        Run the full WTA Monte Carlo simulation.
+        Run the full WTA Monte Carlo simulation with jump diffusion,
+        **trend-projected drift**, **competition-aware volatility**,
+        and **cross-artist correlation**.
+
+        Key improvements over the snapshot-only model:
+
+        1.  **Trend-projected OU mean**: Instead of mean-reverting to
+            today's spot, the OU target is the trend-projected level
+            at expiry: ``mu_i = spot_i * exp(trend_i * T)``.
+            This gives the model "memory" of recent trajectory.
+
+        2.  **Competition-aware volatility**: When the gap between
+            the top-2 artists is < 5%, sigma is boosted for all
+            artists, reflecting the genuine uncertainty in tight races.
+            Boost factor ranges from 1.0 (at 5% gap) to 3.0 (at 0%).
+
+        3.  **Cross-artist correlation**: The top-3 contenders (by
+            current listeners) have negatively correlated Brownian
+            shocks (rho = -0.15), modelling the zero-sum nature of
+            playlist slots and listener attention.
 
         Parameters
         ----------
         artists : list[OUArtistInput]
-            Per-artist spot, sigma, and velocity.
+            Per-artist spot, sigma, velocity, and trend.
         T : float
             Time to expiry in years (e.g. 15/365).
         jump_beta : float
-            TikTok → listener lagged correlation.  Shifts the
-            long-term mean upward for viral artists.
-        min_contention_prob : float
-            Minimum analytical P(beats leader) for an artist to remain
-            in contention.  Artists below this threshold get
-            deterministic paths (sigma → 0), so their probability
-            naturally flows to real contenders.
-            Set to 0 to disable (all artists keep full sigma).
-            Default 0.001 (0.1%) — conservative, only prunes artists
-            with essentially no chance.
+            TikTok → listener lagged correlation.
 
         Returns
         -------
@@ -565,55 +523,148 @@ class MonteCarloOU:
         trends = np.array(
             [a.trend for a in artists], dtype=np.float64,
         )
+        momentums = np.array(
+            [a.momentum for a in artists], dtype=np.float64,
+        )
 
-        # Long-term mean: current spot adjusted for TikTok momentum
-        mu = spots * (1.0 + jump_beta * velocities)
+        # ── Multi-factor drift: trend + TikTok velocity + momentum ───
+        # The momentum score ([-1, 1]) captures cross-platform signals
+        # that aren't in the listener trend: spotify_popularity changes,
+        # follower acceleration, wikipedia spikes, playlist reach, etc.
+        #
+        # MOMENTUM_SCALE controls the max drift boost from momentum.
+        # 0.03 = ±3% terminal value adjustment for max momentum.
+        MOMENTUM_SCALE = 0.03
 
-        # Convert percentage vol to absolute vol
-        # sigma_abs = annualised_pct_vol * spot
-        sigma_abs = sigmas_pct * spots
+        trend_projection = np.exp(trends * T)
+        momentum_boost = 1.0 + momentums * MOMENTUM_SCALE
+        mu = spots * trend_projection * (1.0 + jump_beta * velocities) * momentum_boost
 
-        # ── Analytical contention filter ─────────────────────────────
-        # Use the model's own closed-form OU solution to identify
-        # artists with negligible chance of winning.  Their sigma is
-        # zeroed → deterministic paths → probability concentrates on
-        # real contenders.  Fully data-driven, no manual tuning.
-        # The filter accounts for both volatility AND trend.
-        if min_contention_prob > 0:
-            contender_mask = self._analytical_contention_mask(
-                spots, mu, sigma_abs, self.theta, T, trends,
-                min_prob=min_contention_prob,
+        # ── Momentum-aware volatility ────────────────────────────────
+        # Strong momentum (positive or negative) means the artist is in
+        # flux — sigma should be slightly higher.  This prevents the
+        # model from being overconfident about trending artists.
+        MOMENTUM_VOL_BOOST = 0.5  # ±50% vol boost for max |momentum|
+        vol_factor = 1.0 + MOMENTUM_VOL_BOOST * np.abs(momentums)
+        sigmas_pct = sigmas_pct * vol_factor
+
+        # ── Competition-aware adjustments ────────────────────────────
+        # When the top-2 artists are within 8% of each other, two
+        # adjustments fire:
+        #
+        # 1. VOLATILITY BOOST: sigma is scaled up so the diffusion
+        #    cone properly reflects the uncertainty in tight races.
+        #    Boost factor: 1.0x at 8% gap → 4.0x at 0% gap.
+        #
+        # 2. THETA REDUCTION: mean-reversion is weakened so the OU
+        #    process becomes more random-walk-like.  A tight race is
+        #    inherently unstable — the "stickiness" assumption that
+        #    works for individual artists is wrong when two are
+        #    neck-and-neck.
+        #    Theta factor: 1.0x at 8% gap → 0.1x at 0% gap.
+        theta_eff = self.theta
+        if n_artists >= 2:
+            sorted_spots = np.sort(spots)[::-1]
+            gap_pct = (
+                (sorted_spots[0] - sorted_spots[1]) / sorted_spots[0]
+                if sorted_spots[0] > 0 else 1.0
             )
-            n_contenders = int(contender_mask.sum())
-            # Zero out sigma AND trend for non-contenders
-            sigma_abs = np.where(contender_mask, sigma_abs, 0.0)
-            trends = np.where(contender_mask, trends, 0.0)
-        else:
-            n_contenders = n_artists
+            COMPETITION_THRESHOLD = 0.08  # 8% gap
+            if gap_pct < COMPETITION_THRESHOLD:
+                closeness = (
+                    COMPETITION_THRESHOLD - gap_pct
+                ) / COMPETITION_THRESHOLD  # 0 at threshold, 1 at 0% gap
+
+                # Sigma boost: 1.0x → 4.0x
+                sigma_boost = 1.0 + 3.0 * closeness
+                sigmas_pct = sigmas_pct * sigma_boost
+
+                # Theta reduction: 1.0x → 0.1x (near random walk)
+                theta_eff = self.theta * max(1.0 - 0.9 * closeness, 0.1)
+
+        # ── Cross-artist correlation matrix ──────────────────────────
+        # Top contenders compete for the same playlist slots and
+        # listener attention — when one gains, another tends to lose.
+        # Model this with modest negative correlation (rho = -0.15)
+        # between the top-3 contenders.
+        CROSS_CORR = -0.15
+        corr = np.eye(n_artists)
+        if n_artists >= 2:
+            sorted_idx = np.argsort(-spots)
+            n_top = min(3, n_artists)
+            for i in range(n_top):
+                for j in range(i + 1, n_top):
+                    corr[sorted_idx[i], sorted_idx[j]] = CROSS_CORR
+                    corr[sorted_idx[j], sorted_idx[i]] = CROSS_CORR
+
+        # Cholesky factorization for correlated draws
+        try:
+            L = np.linalg.cholesky(corr)
+            use_corr = True
+        except np.linalg.LinAlgError:
+            use_corr = False
+
+        # ── Per-artist jump parameters ───────────────────────────────
+        per_artist_intensity = np.array([
+            (a.jump_intensity if a.jump_intensity is not None
+             else self.jump_intensity) * a.event_impact_score
+            for a in artists
+        ], dtype=np.float64)
+
+        per_artist_jump_std = np.array([
+            (a.jump_std if a.jump_std is not None
+             else self.jump_std)
+            * (1.0 + 0.5 * (a.event_impact_score - 1.0))
+            for a in artists
+        ], dtype=np.float64)
+
+        jump_prob_per_step = per_artist_intensity * dt
+        use_jumps = bool(np.any(per_artist_intensity > 0)
+                         and np.any(per_artist_jump_std > 0))
+
+        jump_prob_bcast = jump_prob_per_step[np.newaxis, :]
+        jump_std_bcast = per_artist_jump_std[np.newaxis, :]
 
         # ── Initialise paths: shape (n_paths, n_artists) ─────────────
         X = np.tile(spots, (self.n_paths, 1))
 
-        # ── Simulate (trending OU process) ───────────────────────────
-        # dX = theta*(mu - X)*dt + trend*dt + sigma_abs*sqrt(dt)*dW
-        #
-        # The trend term adds an independent directional drift on top
-        # of mean-reversion.  This is critical: theta is slow (~0.055)
-        # so mu-adjustment alone barely moves the needle over 12 days.
-        # The trend directly encodes observed momentum (listener growth,
-        # TikTok virality) as a per-artist drift rate.
+        # ── Simulate ─────────────────────────────────────────────────
         for _ in range(n_steps):
-            Z = rng.standard_normal((self.n_paths, n_artists))
-            drift_mr = self.theta * (mu - X) * dt
-            drift_momentum = trends * dt
+            Z_raw = rng.standard_normal((self.n_paths, n_artists))
+
+            # Apply cross-correlation via Cholesky transform
+            Z = Z_raw @ L.T if use_corr else Z_raw
+
+            drift = theta_eff * (mu - X) * dt
+            sigma_abs = sigmas_pct * X  # level-proportional volatility
             diffusion = sigma_abs * sqrt_dt * Z
-            X = X + drift_mr + drift_momentum + diffusion
+            X = X + drift + diffusion
+
+            # ── Jump component (Merton-style, per-artist) ────────────
+            if use_jumps:
+                jump_mask = (
+                    rng.random((self.n_paths, n_artists)) < jump_prob_bcast
+                )
+                jump_log = (
+                    rng.standard_normal((self.n_paths, n_artists))
+                    * jump_std_bcast
+                )
+                jump_sizes = np.exp(jump_log)
+                X = np.where(jump_mask, X * jump_sizes, X)
+
             np.maximum(X, 0, out=X)  # listeners can't go negative
 
         # ── Count wins ───────────────────────────────────────────────
         winners = np.argmax(X, axis=1)                # (n_paths,)
         win_counts = np.bincount(winners, minlength=n_artists)
-        probs = win_counts / self.n_paths
+
+        # ── Laplace smoothing ────────────────────────────────────────
+        alpha = self.laplace_alpha
+        if alpha > 0:
+            smoothed_counts = win_counts.astype(np.float64) + alpha
+            probs = smoothed_counts / (self.n_paths + n_artists * alpha)
+        else:
+            probs = win_counts / self.n_paths
 
         # ── Build results ────────────────────────────────────────────
         results = []

@@ -37,6 +37,9 @@ class CalibrationResult:
     tiktok_p95: float     # 95th percentile of tiktok_sound_posts_change
     vol_gamma: float      # conditional vol sensitivity (TikTok → vol)
     theta: float = 0.1    # OU mean-reversion speed (annualised)
+    jump_intensity: float = 12.0  # annualised Poisson jump arrival rate
+    jump_std: float = 0.04        # log-normal std of jump sizes
+    trend: float = 0.0    # annualised growth rate (EWMA of recent log-returns)
 
     def to_dict(self) -> Dict[str, float | int]:
         return {
@@ -46,6 +49,9 @@ class CalibrationResult:
             "tiktok_p95": self.tiktok_p95,
             "vol_gamma": self.vol_gamma,
             "theta": self.theta,
+            "jump_intensity": self.jump_intensity,
+            "jump_std": self.jump_std,
+            "trend": self.trend,
         }
 
 
@@ -331,13 +337,20 @@ class Calibrator:
 
         Method
         ------
-        1.  Compute the lag-1 autocorrelation (rho) of daily listener
-            *levels* (not returns).  For a discrete OU process sampled
-            at interval dt:  ``rho = exp(-theta * dt)``.
+        The raw lag-1 autocorrelation of *levels* is nearly 1.0 for any
+        growing artist, making theta ≈ 0 (i.e. a random walk).  This is
+        because autocorrelation on non-stationary data captures the trend,
+        not the mean-reversion.
 
-        2.  Invert:  ``theta = -ln(rho) / dt``   (annualised).
+        Instead we use an OLS regression approach on **detrended** data:
 
-        3.  Clamp to [0.01, 10.0] to avoid degenerate values.
+        1.  Remove the linear trend from the listener series to obtain
+            residuals (the "deviation from trend").
+        2.  Regress residual(t) on residual(t-1):
+                residual(t) = a + b * residual(t-1) + epsilon
+            For a discrete OU: b = exp(-theta * dt).
+        3.  Invert: theta = -ln(b) / dt   (annualised).
+        4.  Clamp to [0.01, 10.0] to avoid degenerate values.
 
         Returns
         -------
@@ -350,12 +363,27 @@ class Calibrator:
             logger.warning("Too few data points for theta — using default 0.1")
             return 0.1
 
-        # Lag-1 autocorrelation of levels
-        rho = float(listeners.autocorr(lag=1))
+        # ── Detrend: remove linear growth to isolate mean-reverting component
+        x_idx = np.arange(len(listeners), dtype=float)
+        coeffs = np.polyfit(x_idx, listeners.values, 1)
+        trend = np.polyval(coeffs, x_idx)
+        residuals = pd.Series(listeners.values - trend, index=listeners.index)
+
+        # ── Lag-1 autocorrelation of detrended residuals
+        rho = float(residuals.autocorr(lag=1))
 
         if np.isnan(rho) or rho <= 0 or rho >= 1.0:
-            logger.info("Autocorrelation invalid (rho=%.4f) — using default 0.1", rho)
-            return 0.1
+            # Fallback: try raw levels (short windows may already be ~stationary)
+            rho_raw = float(listeners.autocorr(lag=1))
+            if not np.isnan(rho_raw) and 0 < rho_raw < 1.0:
+                rho = rho_raw
+            else:
+                logger.info(
+                    "Autocorrelation invalid (detrended rho=%.4f, raw=%.4f) "
+                    "— using default 0.1",
+                    rho, rho_raw if not np.isnan(rho_raw) else float("nan"),
+                )
+                return 0.1
 
         dt = 1.0 / 365.0
         theta = -math.log(rho) / dt
@@ -364,11 +392,137 @@ class Calibrator:
         theta = float(np.clip(theta, 0.01, 10.0))
 
         logger.info(
-            "OU theta — rho=%.6f | theta_annual=%.4f "
+            "OU theta — detrended rho=%.6f | theta_annual=%.4f "
             "(half-life ≈ %.1f days)",
             rho, theta, math.log(2) / theta * 365 if theta > 0 else float("inf"),
         )
         return theta
+
+    # ── trend: recent growth trajectory ────────────────────────────────
+
+    def compute_trend(self, window: int = 7) -> float:
+        """
+        Recent Growth Trajectory (annualised).
+
+        Uses an **exponentially-weighted mean** of daily log-returns
+        over the last ``window`` days.  EWMA gives more weight to the
+        most recent days, capturing acceleration/deceleration.
+
+        This is the single most important input for the trend-projected
+        OU model: it tells the simulation *where the artist is heading*,
+        not just where they are now.
+
+        Returns
+        -------
+        float
+            Annualised growth rate.  Positive = gaining listeners.
+            Clamped to [-2.0, 2.0] to prevent extrapolation artefacts.
+        """
+        listeners = self.df["spotify_monthly_listeners"].astype(float).dropna()
+
+        if len(listeners) < 3:
+            return 0.0
+
+        # Use the most recent `window+1` observations
+        recent = listeners.tail(window + 1)
+        log_rets = np.log(recent / recent.shift(1)).dropna()
+        log_rets = log_rets[np.isfinite(log_rets)]
+
+        if len(log_rets) < 2:
+            return 0.0
+
+        # EWMA with span = window gives ~86% weight to last `window` days
+        ewma_daily = float(log_rets.ewm(span=window).mean().iloc[-1])
+        trend_annual = ewma_daily * 365
+
+        # Clamp to prevent absurd extrapolation
+        trend_annual = float(np.clip(trend_annual, -2.0, 2.0))
+
+        logger.info(
+            "Trend — EWMA(7d) daily=%.6f | annualised=%.4f (%.2f%%/day)",
+            ewma_daily, trend_annual, ewma_daily * 100,
+        )
+        return trend_annual
+
+    # ── jump calibration ────────────────────────────────────────────────
+
+    def compute_jump_params(self) -> tuple[float, float]:
+        """
+        Calibrate jump intensity (λ) and jump size (σ_J) from historical data.
+
+        Method
+        ------
+        1.  Compute daily log-returns of ``spotify_monthly_listeners``.
+        2.  Estimate "normal" diffusion volatility via the **median absolute
+            deviation** (MAD) — robust to jump contamination.
+        3.  Flag any day where |log-return| > 3 × MAD-sigma as a "jump day".
+        4.  Count jump days → annualise → ``jump_intensity``.
+        5.  Measure the std of detected jump log-returns → ``jump_std``.
+
+        Returns
+        -------
+        (jump_intensity, jump_std) : tuple[float, float]
+            jump_intensity: annualised Poisson arrival rate.
+            jump_std: log-normal std of jump sizes.
+        """
+        listeners = self.df["spotify_monthly_listeners"].astype(float).dropna()
+
+        if len(listeners) < 30:
+            logger.warning("Too few data points for jump calibration — using defaults")
+            return 12.0, 0.04
+
+        # Daily log returns (filter out zero/negative for safety)
+        valid = listeners[listeners > 0]
+        log_returns = np.log(valid / valid.shift(1)).dropna()
+        log_returns = log_returns[np.isfinite(log_returns)]
+
+        if len(log_returns) < 20:
+            logger.warning("Too few valid log returns — using default jump params")
+            return 12.0, 0.04
+
+        # Robust volatility via MAD (resistant to jump contamination)
+        median_ret = float(np.median(log_returns))
+        mad = float(np.median(np.abs(log_returns - median_ret)))
+        sigma_robust = mad * 1.4826  # MAD → σ conversion for normal dist
+
+        if sigma_robust <= 0:
+            logger.warning("MAD-sigma is zero — using default jump params")
+            return 12.0, 0.04
+
+        # Flag jumps: |log-return| > 3 × robust_sigma
+        threshold = 3.0 * sigma_robust
+        jump_mask = np.abs(log_returns) > threshold
+        jump_returns = log_returns[jump_mask]
+        n_jumps = int(jump_mask.sum())
+        n_days = len(log_returns)
+
+        # Annualise jump intensity
+        if n_days > 0 and n_jumps > 0:
+            daily_intensity = n_jumps / n_days
+            jump_intensity = daily_intensity * 365.0
+        else:
+            jump_intensity = 6.0  # mild default: ~0.5/month
+
+        # Jump std: std of detected jump absolute log-returns
+        if n_jumps >= 3:
+            jump_std = float(np.std(np.abs(jump_returns)))
+        elif n_jumps > 0:
+            jump_std = float(np.mean(np.abs(jump_returns)))
+        else:
+            # No detected jumps — use 2× normal vol as a prior
+            jump_std = sigma_robust * 2.0
+
+        # Clamp to reasonable ranges
+        jump_intensity = float(np.clip(jump_intensity, 1.0, 120.0))
+        jump_std = float(np.clip(jump_std, 0.005, 0.30))
+
+        logger.info(
+            "Jump calibration — %d jumps in %d days (%.1f/yr) | "
+            "σ_robust=%.6f | threshold=%.6f | jump_std=%.4f",
+            n_jumps, n_days, jump_intensity,
+            sigma_robust, threshold, jump_std,
+        )
+        return jump_intensity, jump_std
 
     # ── normalisation stats ─────────────────────────────────────────────
 
@@ -412,6 +566,10 @@ class Calibrator:
 
         theta = self.compute_theta()
 
+        jump_intensity, jump_std = self.compute_jump_params()
+
+        trend = self.compute_trend()
+
         result = CalibrationResult(
             sigma=sigma,
             jump_beta=jump_beta,
@@ -419,6 +577,9 @@ class Calibrator:
             tiktok_p95=tiktok_p95,
             vol_gamma=vol_gamma,
             theta=theta,
+            jump_intensity=jump_intensity,
+            jump_std=jump_std,
+            trend=trend,
         )
 
         logger.info("Calibration complete: %s", result.to_dict())

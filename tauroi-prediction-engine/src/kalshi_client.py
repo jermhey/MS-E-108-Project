@@ -637,6 +637,109 @@ class KalshiClient:
         logger.info("Fetched %d trades for %s", len(trades), ticker)
         return trades, next_cursor
 
+    # ── Historical Market Discovery ────────────────────────────────────
+
+    def find_monthly_listener_markets(
+        self,
+        artist_name: str,
+        series_prefix: str = "KXTOPMONTHLY",
+    ) -> list[Dict[str, Any]]:
+        """
+        Find past monthly listener WTA markets by constructing tickers.
+
+        Kalshi's monthly listener markets follow the pattern:
+            Event:  KXTOPMONTHLY-{YY}{MON}
+            Market: KXTOPMONTHLY-{YY}{MON}-{SUFFIX}
+
+        This method tries each month from June 2025 forward, fetching
+        the event and finding the artist's specific contract.
+
+        Returns
+        -------
+        list[dict]
+            Each dict has: event_ticker, market_ticker, title,
+            close_time, result, volume, expiry_date.
+            Sorted chronologically (oldest first).
+        """
+        import datetime as _dt
+
+        artist_lower = artist_name.lower()
+        month_codes = [
+            "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+        ]
+
+        # Generate tickers from June 2025 to current month
+        now = _dt.datetime.now(_dt.timezone.utc)
+        candidates: list[str] = []
+        for year in [25, 26]:
+            start_month = 6 if year == 25 else 1
+            end_month = 12 if year == 25 else now.month + 1
+            for m in range(start_month, min(end_month + 1, 13)):
+                candidates.append(f"{series_prefix}-{year}{month_codes[m - 1]}")
+
+        results: list[Dict[str, Any]] = []
+
+        for event_ticker in candidates:
+            try:
+                event = self.get_event(event_ticker)
+            except Exception:
+                continue
+
+            markets = event.get("markets", [])
+            title = event.get("title", "")
+
+            # Find the artist's contract
+            for m in markets:
+                name = (
+                    m.get("yes_sub_title", "")
+                    or m.get("custom_strike", {}).get("Artist", "")
+                )
+                if artist_lower in name.lower():
+                    close_time = m.get(
+                        "close_time", m.get("expiration_time", ""),
+                    )
+
+                    # Parse expiry date
+                    expiry_date = None
+                    if close_time:
+                        try:
+                            dt = _dt.datetime.fromisoformat(
+                                close_time.replace("Z", "+00:00")
+                            )
+                            expiry_date = dt.date()
+                        except (ValueError, TypeError):
+                            pass
+
+                    results.append({
+                        "event_ticker": event_ticker,
+                        "market_ticker": m.get("ticker", ""),
+                        "title": title,
+                        "close_time": close_time,
+                        "expiry_date": expiry_date,
+                        "result": m.get("result", ""),
+                        "last_price": m.get("last_price", 0) or 0,
+                        "volume": m.get("volume", 0) or 0,
+                        "status": m.get("status", ""),
+                    })
+                    logger.info(
+                        "  Found: %s  vol=%s  result=%s",
+                        m.get("ticker", ""), m.get("volume", 0),
+                        m.get("result", "?"),
+                    )
+                    break
+
+        # Sort by expiry date (oldest first)
+        results.sort(key=lambda r: r.get("expiry_date") or _dt.date.min)
+
+        logger.info(
+            "Found %d monthly listener markets for %s (%s → %s)",
+            len(results), artist_name,
+            results[0]["event_ticker"] if results else "—",
+            results[-1]["event_ticker"] if results else "—",
+        )
+        return results
+
     @property
     def is_authenticated(self) -> bool:
         return self._authenticated

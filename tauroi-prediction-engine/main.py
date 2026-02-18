@@ -46,12 +46,6 @@ from src.utils import get_logger, format_signal
 
 EDGE_THRESHOLD = 0.05
 DEFAULT_STRIKE = 100_000_000
-# Multi-window sigma: None = auto (max of 90d/180d/365d windows).
-# Set to an int to force a single window (e.g. 90 for 90-day only).
-SIGMA_WINDOW: int | None = None
-# Analytical contention filter: min P(beats leader) to stay in the MC.
-# Fully data-driven via OU closed-form.  0.001 = 0.1%.
-MIN_CONTENTION_PROB = 0.001
 SIGNAL_LOG_DIR = pathlib.Path(__file__).resolve().parent / "signals"
 
 logger = get_logger("tauroi.main")
@@ -227,7 +221,6 @@ def load_data_from_api(settings: Settings) -> pd.DataFrame:
                     "(%d rows) for calibration",
                     str(exc)[:80], len(cached_df),
                 )
-                # Ensure columns the Calibrator expects
                 if "event_impact_score" not in cached_df.columns:
                     cached_df["event_impact_score"] = 1.0
                 if "tiktok_sound_posts_change" not in cached_df.columns:
@@ -236,6 +229,33 @@ def load_data_from_api(settings: Settings) -> pd.DataFrame:
                 return cached_df, client
 
         raise  # No cache available — propagate the original error
+
+    # ── Check for stale data (rate-limited API returned only partial history)
+    # If the API returned data ending > 7 days ago, prefer the cached version
+    # which is more complete.
+    artist_id = settings.chartmetric_artist_id
+    cm_id = int(artist_id) if artist_id and artist_id.isdigit() else None
+
+    if cm_id is not None and not df.empty:
+        latest_date = pd.to_datetime(df["Date"]).max()
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=7)
+        if latest_date < cutoff:
+            cached_df = client._load_stale_cache(cm_id)
+            if cached_df is not None and not cached_df.empty:
+                cached_latest = pd.to_datetime(cached_df["Date"]).max()
+                if cached_latest > latest_date:
+                    logger.warning(
+                        "API returned stale data (ends %s) — using CACHED data "
+                        "(%d rows, ends %s) instead",
+                        str(latest_date)[:10], len(cached_df),
+                        str(cached_latest)[:10],
+                    )
+                    if "event_impact_score" not in cached_df.columns:
+                        cached_df["event_impact_score"] = 1.0
+                    if "tiktok_sound_posts_change" not in cached_df.columns:
+                        cached_df["tiktok_sound_posts_change"] = 0.0
+                    client._last_release_count = 0
+                    return cached_df, client
 
     return df, client
 
@@ -271,6 +291,8 @@ def run_calibration_from_df(df: pd.DataFrame) -> CalibrationResult:
     print(f"  Half-Life                    : {hl:>11.1f}  days")
     print(f"  Best TikTok Lag              : {result.best_lag:>12d}  days")
     print(f"  TikTok P95 (norm cap)        : {result.tiktok_p95:>12,.0f}")
+    print(f"  Jump Intensity (λ)           : {result.jump_intensity:>12.1f}  /year")
+    print(f"  Jump Std (σ_J)               : {result.jump_std:>12.4f}")
     print("  " + "=" * 52)
     print()
 
@@ -517,16 +539,51 @@ def run_real_strategy(
     sigma_adj = pricer.adjusted_sigma_calibrated(
         cal.sigma, normalized_velocity, cal.vol_gamma, event_impact_score,
     )
-    fair_value = pricer.fair_value_calibrated(
-        spot_official=spot_official,
-        normalized_velocity=normalized_velocity,
-        strike=effective_strike,
-        sigma=cal.sigma,
-        jump_beta=cal.jump_beta,
-        vol_gamma=cal.vol_gamma,
-        event_impact_score=event_impact_score,
-        T=T,
-    )
+
+    # ── Use the correct pricing model based on market type ────────
+    if market_type == "winner_take_all" and competitor_data:
+        # Build MC-OU inputs from live competitor data
+        mc_inputs = [
+            OUArtistInput(
+                name=ARTIST_NAME,
+                listeners=spot_official,
+                sigma=sigma_adj,
+                norm_velocity=normalized_velocity,
+            ),
+        ]
+        for cd in competitor_data:
+            mc_inputs.append(OUArtistInput(
+                name=cd["name"],
+                listeners=float(cd["listeners"]),
+                sigma=cal.sigma,  # use base sigma for competitors
+                norm_velocity=0.0,
+            ))
+
+        mc = MonteCarloOU(
+            theta=cal.theta, n_paths=10_000,
+            jump_intensity=cal.jump_intensity,
+            jump_std=cal.jump_std,
+        )
+        mc_results = mc.simulate_wta(mc_inputs, T=T, jump_beta=cal.jump_beta)
+
+        # Find our artist's probability
+        our_result = next(
+            (r for r in mc_results if r.name == ARTIST_NAME), None,
+        )
+        fair_value = our_result.probability if our_result else 0.01
+    else:
+        # Standard binary call pricing
+        fair_value = pricer.fair_value_calibrated(
+            spot_official=spot_official,
+            normalized_velocity=normalized_velocity,
+            strike=effective_strike,
+            sigma=cal.sigma,
+            jump_beta=cal.jump_beta,
+            vol_gamma=cal.vol_gamma,
+            event_impact_score=event_impact_score,
+            T=T,
+        )
+
     edge = fair_value - market_price
     signal = format_signal(edge, threshold=EDGE_THRESHOLD)
 
@@ -696,42 +753,37 @@ def run_market_scan(
     # ══════════════════════════════════════════════════════════════════
     #  Monte Carlo OU Simulation (replaces per-artist GBM)
     # ══════════════════════════════════════════════════════════════════
-    # Simulate ALL artists simultaneously using a trending OU process.
-    # Each artist has:
-    #   - sigma: volatility (multi-window, from recent data)
-    #   - trend: directional momentum (14d listener slope + TikTok)
-    #   - velocity: TikTok virality (shifts long-term mean via jump_beta)
-    # Probabilities sum to 1.0 by construction.
+    # Simulate ALL artists simultaneously using a mean-reverting
+    # Ornstein-Uhlenbeck process.  At expiry, the artist with the most
+    # listeners wins.  Probabilities sum to 1.0 by construction — no
+    # normalization hack needed.
     N_PATHS = 10_000
 
-    mc_inputs = []
-    for a in all_artists:
-        spot = float(a["listeners"])
-        # Trend: annualised absolute drift from observed growth signals.
-        # Primary signal: 14-day OLS slope of daily listeners (most robust).
-        # The raw slope is in listeners/day — annualise by *365.
-        trend_daily = float(a.get("listener_trend_daily", 0.0))
-        trend_annual = trend_daily * 365.0
-
-        mc_inputs.append(OUArtistInput(
+    mc_inputs = [
+        OUArtistInput(
             name=a["name"],
-            listeners=spot,
+            listeners=float(a["listeners"]),
             sigma=float(a.get("sigma", cal.sigma)),
             norm_velocity=float(a.get("norm_velocity", 0.0)),
-            trend=trend_annual,
-        ))
+            event_impact_score=float(a.get("event_impact_score", 1.0)),
+            trend=float(a.get("trend", 0.0)),
+            momentum=float(a.get("momentum", 0.0)),
+        )
+        for a in all_artists
+    ]
 
-    mc = MonteCarloOU(theta=cal.theta, n_paths=N_PATHS, seed=42)
-    mc_results = mc.simulate_wta(
-        mc_inputs, T=T, jump_beta=cal.jump_beta,
-        min_contention_prob=MIN_CONTENTION_PROB,
+    mc = MonteCarloOU(
+        theta=cal.theta, n_paths=N_PATHS,
+        jump_intensity=cal.jump_intensity,
+        jump_std=cal.jump_std,
     )
+    mc_results = mc.simulate_wta(mc_inputs, T=T, jump_beta=cal.jump_beta)
 
     logger.info(
         "MC-OU simulation complete: %d artists × %d paths × %d steps "
-        "| theta=%.4f | min_contention=%.4f | sigma_window=%s | sum(P)=%.4f",
+        "| theta=%.4f | sum(P)=%.4f",
         len(mc_inputs), N_PATHS, max(int(T * 365), 1),
-        cal.theta, MIN_CONTENTION_PROB, SIGMA_WINDOW,
+        cal.theta,
         sum(r.probability for r in mc_results),
     )
 
@@ -768,7 +820,6 @@ def run_market_scan(
             "name": name,
             "listeners": int(mc_r.spot),
             "change_pct": artist.get("change_pct"),
-            "listener_trend_daily": artist.get("listener_trend_daily", 0.0),
             "sigma": float(artist.get("sigma", cal.sigma)),
             "norm_velocity": float(artist.get("norm_velocity", 0.0)),
             "tiktok_velocity": artist.get("tiktok_velocity", 0),
@@ -804,19 +855,16 @@ def run_market_scan(
     print("  " + "=" * 110)
     print(f"  FULL MARKET SCAN — Ornstein-Uhlenbeck Monte Carlo ({N_PATHS:,} paths)")
     print(f"  {event_title}")
-    sw_label = f"{SIGMA_WINDOW}d" if SIGMA_WINDOW else "multi(90/180/365)"
-    print(f"  T = {T * 365:.1f} days  |  theta = {cal.theta:.4f}  |  beta = {cal.jump_beta:.4f}  |  sigma = {sw_label}  |  min_contention = {MIN_CONTENTION_PROB}  |  sum(P) = {sum(r.probability for r in mc_results):.4f}")
+    print(f"  T = {T * 365:.1f} days  |  theta = {cal.theta:.4f}  |  beta = {cal.jump_beta:.4f}  |  sum(P) = {sum(r.probability for r in mc_results):.4f}")
     print("  " + "=" * 110)
     print()
-    print(f"  {'Artist':<22s} {'Listeners':>14s} {'7d Chg':>8s} {'Trend/d':>9s}"
+    print(f"  {'Artist':<22s} {'Listeners':>14s} {'7d Chg':>8s}"
           f" {'Sigma':>8s} {'TikTok':>8s}"
           f" {'Model':>8s} {'Kalshi':>8s} {'Edge':>8s}  {'Signal':<6s} {'Wins':>7s}")
-    print("  " + "-" * 120)
+    print("  " + "-" * 110)
 
     for row in scan_rows:
         chg = f"{row['change_pct']:+.1f}%" if row["change_pct"] is not None else "—"
-        trend_d = row.get("listener_trend_daily", 0.0)
-        trend_str = f"{trend_d/1e6:+.2f}M" if abs(trend_d) >= 1000 else f"{trend_d:+.0f}"
         sigma_str = f"{row['sigma']:.0%}"
         vel_str = f"{row['norm_velocity']:.2f}" if row["norm_velocity"] > 0 else "—"
         fv_pct = f"{row['fair_value']:.1%}"
@@ -825,7 +873,7 @@ def run_market_scan(
         wins_str = f"{row.get('mc_wins', 0):,}"
         star = " *" if row["signal"] == "BUY" else ""
         print(
-            f"  {row['name']:<22s} {row['listeners']:>14,d} {chg:>8s} {trend_str:>9s}"
+            f"  {row['name']:<22s} {row['listeners']:>14,d} {chg:>8s}"
             f" {sigma_str:>8s} {vel_str:>8s}"
             f" {fv_pct:>8s} {mkt:>8s} {edge_str:>8s}  {row['signal']:<6s}{wins_str:>7s}{star}"
         )
@@ -894,10 +942,7 @@ def run_market_scan(
             "signal": row["signal"],
             "sigma": round(row["sigma"], 6),
             "norm_velocity": row["norm_velocity"],
-            "listener_trend_daily": row.get("listener_trend_daily", 0.0),
             "theta": round(cal.theta, 6),
-            "sigma_window": SIGMA_WINDOW,
-            "min_contention_prob": MIN_CONTENTION_PROB,
             "mc_paths": N_PATHS,
             "mc_wins": row.get("mc_wins", 0),
             "mc_avg_final": row.get("mc_avg_final", 0),
@@ -1082,6 +1127,9 @@ def _run_alpha_analysis(
 
     Uses historical Kalshi candlestick/trade data and walk-forward
     model reconstruction from Chartmetric data.
+
+    For WTA markets, uses the MC-OU engine with cached competitor data
+    for accurate historical fair-value reconstruction.
     """
     from src.analysis.lead_lag import LeadLagAnalyzer
     from src.kalshi_client import KalshiClient
@@ -1089,6 +1137,7 @@ def _run_alpha_analysis(
     contract = market_result["target_contract"]
     ticker = contract.get("ticker", "")
     expiry_str = contract.get("close_time", contract.get("expiration_time", ""))
+    market_type = market_result.get("market_type", "binary")
 
     # Parse expiry date
     expiry_date = None
@@ -1102,26 +1151,37 @@ def _run_alpha_analysis(
             pass
 
     if expiry_date is None:
-        # Default to ~30 days from now
         expiry_date = (
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
         ).date()
 
-    # Determine strike for this market
-    # For WTA markets, the "strike" is the max competitor listeners
-    competitors = market_result.get("competitors", [])
-    if market_result["market_type"] == "winner_take_all" and competitors:
-        # Use the leader's listener count (heuristic: from last scan or default)
-        strike = DEFAULT_STRIKE
-        logger.info(
-            "WTA market detected — using default strike $%s for alpha analysis",
-            f"{strike:,.0f}",
-        )
-    else:
-        strike = DEFAULT_STRIKE
+    strike = DEFAULT_STRIKE
 
     # Build Kalshi client for candlestick access
     kalshi = KalshiClient(settings=settings)
+
+    # ── Search for past monthly markets (same series) ────────────
+    monthly_markets: list[dict] = []
+    if market_type == "winner_take_all":
+        logger.info("WTA market — searching for past monthly markets...")
+        print("\n  Searching for past KXTOPMONTHLY markets...")
+        try:
+            monthly_markets = kalshi.find_monthly_listener_markets(ARTIST_NAME)
+            for mm in monthly_markets:
+                status = mm.get("status", "?")
+                result_str = mm.get("result", "?")
+                vol = mm.get("volume", 0)
+                print(
+                    f"    {mm['market_ticker']:35s}  "
+                    f"status={status:10s}  result={result_str:3s}  vol={vol:>8,}"
+                )
+        except Exception as exc:
+            logger.warning("Monthly market search failed: %s", exc)
+
+        if monthly_markets:
+            print(f"  -> {len(monthly_markets)} monthly market(s) found")
+        else:
+            print("  -> No past monthly markets found")
 
     # Run the analyzer
     analyzer = LeadLagAnalyzer(
@@ -1142,20 +1202,23 @@ def _run_alpha_analysis(
         expiry_date=expiry_date,
         max_lag=10,
         output_path=output_path,
+        market_type=market_type,
+        monthly_markets=monthly_markets if monthly_markets else None,
     )
 
     if result is not None:
-        # Log the result
         append_signal_log({
             "artist": ARTIST_NAME,
             "signal": "ALPHA_ANALYSIS",
             "ticker": ticker,
+            "market_type": market_type,
             "optimal_lag": result.optimal_lag,
             "optimal_corr": result.optimal_corr,
             "lag_unit": result.lag_unit,
             "n_observations": result.n_observations,
             "granger_f": result.granger_f_stat,
             "granger_p": result.granger_p_value,
+            "monthly_markets_used": len(monthly_markets),
         })
 
 
@@ -1168,57 +1231,71 @@ def _run_scan_pipeline(
     no_cache: bool = False,
 ) -> list[Dict[str, Any]]:
     """
-    Full market scan with **per-artist consistent data**.
+    **Data-first** market scan.
 
-    For every artist in the Kalshi market:
-    1.  Resolve name → Chartmetric ID (via search).
-    2.  Fetch **full history** (since 2019) for Spotify, TikTok,
-        YouTube, Shazam, Instagram, and Deezer.
-    3.  Use local Parquet cache to avoid re-fetching (6h TTL).
-    4.  Compute per-artist sigma from their own listener history.
-    5.  Compute per-artist TikTok velocity.
-    6.  Price using per-artist parameters + shared gamma/beta.
+    The field of artists is discovered from **Chartmetric** (by monthly
+    listeners), NOT from the Kalshi market.  This decouples the model's
+    fair value from the market's opinion of who matters.
+
+    Flow
+    ----
+    1.  Chartmetric ``discover_top_artists()`` — identifies the top ~15
+        artists globally by Spotify Monthly Listeners, using a seed list
+        + local cache + any extra names from the Kalshi market.
+    2.  For each artist, fetches full history (since 2019) from Chartmetric.
+    3.  Runs MC-OU on the Chartmetric-derived field.
+    4.  Overlays Kalshi prices for edge calculation.
+
+    The model independently discovers the competitive landscape BEFORE
+    looking at any Kalshi prices.
     """
     from src.chartmetric_client import DEFAULT_HISTORY_START
 
-    # Collect all artist names from the market
+    # ── Collect Kalshi artist names as extra candidates ────────────
     contract = market_result["target_contract"]
     target_name = contract.get("yes_sub_title", contract.get("subtitle", ""))
     comp_names = [c["name"] for c in market_result.get("competitors", [])]
 
-    # Build a deduplicated list of ALL artist names in the market
-    all_names: list[str] = []
+    extra_names: list[str] = []
     if target_name:
-        all_names.append(target_name)
+        extra_names.append(target_name)
     for cn in comp_names:
-        if cn not in all_names:
-            all_names.append(cn)
+        if cn not in extra_names:
+            extra_names.append(cn)
 
-    cache_status = "OFF (--no-cache)" if no_cache else "ON (6h TTL)"
-    logger.info(
-        "SCAN MODE — %d artists × full history (since %s) | cache=%s",
-        len(all_names), DEFAULT_HISTORY_START, cache_status,
-    )
-    print(f"\n  Fetching full-history data for {len(all_names)} artists...")
-    print(f"  Sources: Spotify (listeners/followers/popularity), TikTok, YouTube, Shazam, Instagram, Deezer")
-    print(f"  Cache: {cache_status}")
-    print("  (Identical sources for every artist — no calibration bias)\n")
+    # ── Data-first discovery: Chartmetric decides the field ───────
+    logger.info("=" * 64)
+    logger.info("DATA-FIRST SCAN — Chartmetric discovers the field")
+    logger.info("=" * 64)
 
-    # Fetch consistent per-artist data with caching
-    all_artists = cm_client.get_all_artists_scan_data(
-        all_names,
+    print("\n  DATA-FIRST MODE: Chartmetric determines the competitive field")
+    print("  The model discovers top artists by listeners BEFORE looking at Kalshi\n")
+
+    all_artists = cm_client.discover_top_artists(
+        top_n=15,
+        extra_names=extra_names,
         since=DEFAULT_HISTORY_START,
         use_cache=not no_cache,
-        sigma_window=SIGMA_WINDOW,
     )
 
     if not all_artists:
         logger.error("Could not resolve any artists from Chartmetric.")
         return []
 
+    # ── Check for artists the model found that Kalshi doesn't list ─
+    kalshi_names = set(n.lower() for n in extra_names)
+    model_names = set(a["name"].lower() for a in all_artists)
+    model_only = model_names - kalshi_names
+    if model_only:
+        print(f"\n  NOTE: Model includes {len(model_only)} artist(s) not in Kalshi market:")
+        for name in sorted(model_only):
+            matching = next((a for a in all_artists if a["name"].lower() == name), None)
+            if matching:
+                print(f"    + {matching['name']:<25s}  {matching['listeners']:>14,d} listeners")
+        print("  (These affect WTA probabilities even without Kalshi contracts)\n")
+
     cached = sum(1 for a in all_artists if a.get("data_points", 0) > 365)
-    print(f"\n  Resolved {len(all_artists)} / {len(all_names)} artists "
-          f"({cached} with deep history)\n")
+    print(f"\n  Field: {len(all_artists)} artists ({cached} with deep history)\n")
 
     # Run the full scan with per-artist parameters
     scan_results = run_market_scan(

@@ -56,6 +56,193 @@ DEFAULT_HISTORY_START = "2019-01-01"
 _CACHE_DIR = pathlib.Path(__file__).resolve().parent.parent / "cache"
 _DEFAULT_CACHE_TTL_HOURS = 6
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  Composite Momentum Signal
+# ═════════════════════════════════════════════════════════════════════════════
+
+def compute_momentum(
+    df: pd.DataFrame,
+    as_of: pd.Timestamp | None = None,
+    window: int = 7,
+) -> float:
+    """
+    Compute a composite cross-platform momentum score from cached features.
+
+    Combines growth rates across ALL available signals into a single
+    normalised score in [-1, 1].  This score captures information that
+    the raw listener spot and TikTok velocity miss:
+
+    - spotify_popularity (Spotify's own algorithmic activity score)
+    - spotify_followers growth rate
+    - instagram_followers growth rate
+    - youtube_channel_views growth rate
+    - wikipedia_views spike detection
+    - deezer_fans growth rate
+
+    Each signal is converted to a z-score-like value, then combined
+    with empirical weights.  The result is clipped to [-1, 1].
+
+    Parameters
+    ----------
+    df : DataFrame
+        Cached artist data with Date index or column.
+        Must contain ``spotify_monthly_listeners``; all other columns
+        are optional and contribute if present.
+    as_of : Timestamp or None
+        Use data up to this date only (for backtesting).  If None,
+        uses the full DataFrame.
+    window : int
+        Lookback window in days for growth rate computation (default 7).
+
+    Returns
+    -------
+    float
+        Momentum score in [-1, 1].  Positive = cross-platform tailwind.
+    """
+    if df.empty:
+        return 0.0
+
+    # Ensure Date is usable
+    if "Date" in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+        df = df.set_index("Date")
+    df = df.sort_index()
+
+    if as_of is not None:
+        df = df.loc[:as_of]
+
+    if len(df) < window + 1:
+        return 0.0
+
+    recent = df.tail(window + 1)
+
+    def _growth_rate(col: str) -> float:
+        """7-day growth rate for a column, or 0 if not available."""
+        if col not in recent.columns:
+            return 0.0
+        vals = recent[col].ffill().dropna()
+        if len(vals) < 2:
+            return 0.0
+        old = float(vals.iloc[0])
+        new = float(vals.iloc[-1])
+        if old <= 0 or np.isnan(old) or np.isnan(new):
+            return 0.0
+        return (new - old) / old
+
+    def _level_change(col: str) -> float:
+        """Absolute change in a level metric (like popularity 0-100)."""
+        if col not in recent.columns:
+            return 0.0
+        vals = recent[col].ffill().dropna()
+        if len(vals) < 2:
+            return 0.0
+        return float(vals.iloc[-1]) - float(vals.iloc[0])
+
+    # ── Individual signal scores ─────────────────────────────────────
+    # Each signal gets a normalised score: positive = bullish momentum
+
+    scores = []
+    weights = []
+
+    # 1. Spotify popularity change (0-100 scale; +3 in a week is huge)
+    pop_change = _level_change("spotify_popularity")
+    pop_score = np.clip(pop_change / 5.0, -1.0, 1.0)
+    scores.append(pop_score)
+    weights.append(3.0)  # highest weight — Spotify's own signal
+
+    # 2. Spotify followers growth rate
+    fol_growth = _growth_rate("spotify_followers")
+    fol_score = np.clip(fol_growth / 0.02, -1.0, 1.0)  # 2%/wk = max
+    scores.append(fol_score)
+    weights.append(2.0)
+
+    # 3. Listener growth rate (already captured in trend, lower weight)
+    lis_growth = _growth_rate("spotify_monthly_listeners")
+    lis_score = np.clip(lis_growth / 0.03, -1.0, 1.0)  # 3%/wk = max
+    scores.append(lis_score)
+    weights.append(1.0)
+
+    # 4. Instagram followers growth
+    ig_growth = _growth_rate("instagram_followers")
+    ig_score = np.clip(ig_growth / 0.01, -1.0, 1.0)  # 1%/wk = max
+    scores.append(ig_score)
+    weights.append(1.5)
+
+    # 5. YouTube views growth
+    yt_growth = _growth_rate("youtube_channel_views")
+    yt_score = np.clip(yt_growth / 0.05, -1.0, 1.0)  # 5%/wk = max
+    scores.append(yt_score)
+    weights.append(1.0)
+
+    # 6. Wikipedia views spike (highly indicative of cultural moments)
+    wiki_growth = _growth_rate("wikipedia_views")
+    wiki_score = np.clip(wiki_growth / 0.50, -1.0, 1.0)  # 50%/wk = max
+    scores.append(wiki_score)
+    weights.append(2.0)
+
+    # 7. Deezer fans growth (cross-platform streaming confirmation)
+    dz_growth = _growth_rate("deezer_fans")
+    dz_score = np.clip(dz_growth / 0.02, -1.0, 1.0)  # 2%/wk = max
+    scores.append(dz_score)
+    weights.append(0.5)
+
+    # 8. TikTok velocity trend (already used, but include for momentum)
+    if "tiktok_sound_posts_change" in recent.columns:
+        tt = recent["tiktok_sound_posts_change"].fillna(0)
+        if len(tt) >= 4:
+            recent_avg = float(tt.tail(3).mean())
+            older_avg = float(tt.head(3).mean())
+            tt_accel = (recent_avg - older_avg) / max(older_avg, 1.0)
+            tt_score = np.clip(tt_accel / 0.50, -1.0, 1.0)
+        else:
+            tt_score = 0.0
+    else:
+        tt_score = 0.0
+    scores.append(tt_score)
+    weights.append(1.0)
+
+    # ── Weighted combination ─────────────────────────────────────────
+    scores = np.array(scores)
+    weights = np.array(weights)
+    composite = float(np.average(scores, weights=weights))
+    return float(np.clip(composite, -1.0, 1.0))
+
+
+# ── Seed list: top global Spotify artists by monthly listeners ────────────────
+# This provides the starting point for data-first discovery.
+# Expanded dynamically from Kalshi market data and cache.
+TOP_GLOBAL_ARTISTS_SEED: List[Dict[str, Any]] = [
+    {"name": "Bruno Mars",        "cm_id": 3501},
+    {"name": "The Weeknd",        "cm_id": 3852},
+    {"name": "Taylor Swift",      "cm_id": 2762},
+    {"name": "Billie Eilish",     "cm_id": 5596},
+    {"name": "Bad Bunny",         "cm_id": 214945},
+    {"name": "Ariana Grande",     "cm_id": 795},
+    {"name": "Ed Sheeran",        "cm_id": 1280},
+    {"name": "Drake",             "cm_id": 1352},
+    {"name": "Lady Gaga",         "cm_id": 773},
+    {"name": "Sabrina Carpenter", "cm_id": None},
+    {"name": "Post Malone",       "cm_id": None},
+    {"name": "Rihanna",           "cm_id": None},
+    {"name": "Dua Lipa",          "cm_id": None},
+    {"name": "Coldplay",          "cm_id": None},
+    {"name": "Eminem",            "cm_id": None},
+    {"name": "Travis Scott",      "cm_id": None},
+    {"name": "SZA",               "cm_id": None},
+    {"name": "Kendrick Lamar",    "cm_id": None},
+    {"name": "Justin Bieber",     "cm_id": None},
+    {"name": "Peso Pluma",        "cm_id": None},
+    {"name": "Olivia Rodrigo",    "cm_id": None},
+    {"name": "Doja Cat",          "cm_id": None},
+    {"name": "Harry Styles",      "cm_id": None},
+    {"name": "Tyler, The Creator", "cm_id": None},
+    {"name": "Lana Del Rey",      "cm_id": None},
+    {"name": "Shakira",           "cm_id": None},
+    {"name": "Imagine Dragons",   "cm_id": None},
+    {"name": "Miley Cyrus",       "cm_id": None},
+    {"name": "Kanye West",        "cm_id": None},
+    {"name": "BTS",               "cm_id": None},
+]
+
 
 class ChartmetricAuthError(Exception):
     """Raised when token exchange fails."""
@@ -89,14 +276,6 @@ class ChartmetricClient:
         self._artist_id = self._settings.chartmetric_artist_id
         self._timeout = timeout
         self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36 "
-                "TauroiPredictionEngine/1.0"
-            ),
-        })
 
         # Cache state
         self._cache_dir = _CACHE_DIR
@@ -106,6 +285,12 @@ class ChartmetricClient:
         # Token state
         self._access_token: str = ""
         self._token_expires_at: float = 0.0  # epoch seconds
+
+        # Global rate-limit state: once ANY call gets a 429, stop ALL
+        # API calls until the reset time has passed.  This prevents
+        # burning dozens of wasted 429s in the dashboard when iterating
+        # across artists / sources.
+        self._rate_limit_until: float = 0.0  # epoch seconds
 
         if not self._refresh_token:
             raise ChartmetricAuthError(
@@ -159,6 +344,16 @@ class ChartmetricClient:
     #  HTTP
     # ═════════════════════════════════════════════════════════════════════
 
+    @property
+    def is_rate_limited(self) -> bool:
+        """True if the API is still within a known rate-limit window."""
+        return time.time() < self._rate_limit_until
+
+    @property
+    def rate_limit_seconds_left(self) -> float:
+        """Seconds remaining until the rate limit resets (0 if not limited)."""
+        return max(0.0, self._rate_limit_until - time.time())
+
     def _request(
         self,
         method: str,
@@ -167,6 +362,14 @@ class ChartmetricClient:
         retries: int = 3,
     ) -> Dict[str, Any]:
         """Execute an authenticated request with auto-refresh & exponential backoff."""
+        # ── Global rate-limit gate: skip the call entirely ─────────
+        if self.is_rate_limited:
+            mins = self.rate_limit_seconds_left / 60
+            raise ChartmetricAPIError(
+                f"Rate limited — {mins:.0f}m remaining. "
+                f"Skipping {method} {path} (no API call made)."
+            )
+
         self._ensure_token()
         url = f"{self._base_url}{path}"
         headers = {
@@ -181,79 +384,65 @@ class ChartmetricClient:
                 logger.info("Retry %d/%d — waiting %ds...", attempt, retries, backoff)
                 time.sleep(backoff)
 
-            try:
-                resp = self._session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    timeout=self._timeout,
-                )
-            except requests.RequestException as exc:
-                last_error = str(exc)[:500]
-                logger.error(
-                    "[API ERROR] Network failure on %s %s (attempt %d/%d): %s",
-                    method, path, attempt + 1, retries + 1, last_error,
-                )
-                continue
+            resp = self._session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                timeout=self._timeout,
+            )
 
             if resp.status_code == 401:
-                logger.warning(
-                    "[API ERROR] 401 Unauthorized on %s %s — "
-                    "refreshing token and retrying. Body: %s",
-                    method, path, resp.text[:500],
-                )
+                logger.warning("401 received — refreshing token and retrying")
                 self._refresh_access_token()
                 headers["Authorization"] = f"Bearer {self._access_token}"
                 continue
 
             if resp.status_code == 429:
+                # ── Parse the actual reset window ─────────────────
                 try:
                     retry_after = int(float(
-                        resp.headers.get("Retry-After", "5"),
+                        resp.headers.get("Retry-After", "60"),
                     ))
                 except (ValueError, TypeError):
                     retry_after = 60
 
+                # Also check X-RateLimit-Reset (epoch timestamp)
+                try:
+                    reset_epoch = float(resp.headers.get("X-RateLimit-Reset", "0"))
+                    if reset_epoch > time.time():
+                        retry_after = max(retry_after, int(reset_epoch - time.time()))
+                except (ValueError, TypeError):
+                    pass
+
+                # Set the global gate so NO further calls are wasted
+                self._rate_limit_until = time.time() + retry_after
+                reset_dt = datetime.datetime.fromtimestamp(
+                    self._rate_limit_until,
+                ).strftime("%H:%M:%S")
                 logger.warning(
-                    "[API ERROR] 429 Rate Limited on %s %s — "
-                    "Retry-After: %ds | Body: %s",
-                    method, path, retry_after, resp.text[:500],
+                    "Rate limited (429) — ALL API calls paused until %s "
+                    "(%d min). Falling back to cache.",
+                    reset_dt, retry_after // 60,
                 )
 
-                if retry_after > 120:
-                    raise ChartmetricAPIError(
-                        f"Rate limited (429) with {retry_after}s backoff — "
-                        f"aborting {method} {path}. Try again later or use cache."
-                    )
-
-                time.sleep(retry_after)
-                continue
+                raise ChartmetricAPIError(
+                    f"Rate limited (429) — resets at {reset_dt} "
+                    f"({retry_after // 60}m). {method} {path}"
+                )
 
             if resp.status_code >= 500:
-                last_error = resp.text[:500]
-                logger.error(
-                    "[API ERROR] Server %d on %s %s (attempt %d/%d)\n"
-                    "  Body: %s\n"
-                    "  Headers: %s",
+                last_error = resp.text[:300]
+                logger.warning(
+                    "Server error %d on %s %s (attempt %d/%d)",
                     resp.status_code, method, path, attempt + 1, retries + 1,
-                    last_error,
-                    dict(resp.headers),
                 )
                 continue
 
             if not resp.ok:
-                logger.error(
-                    "[API ERROR] Client %d on %s %s\n"
-                    "  Body: %s\n"
-                    "  Params: %s",
-                    resp.status_code, method, path,
-                    resp.text[:500],
-                    params,
-                )
                 raise ChartmetricAPIError(
                     f"Chartmetric API error {resp.status_code} "
-                    f"for {method} {path}: {resp.text[:500]}"
+                    f"for {method} {path}: {resp.text[:300]}"
                 )
 
             return resp.json()
@@ -580,14 +769,22 @@ class ChartmetricClient:
     #  Competitor Intelligence
     # ═════════════════════════════════════════════════════════════════════
 
+    # Track rate-limit state for search to avoid wasting calls
+    _search_rate_limited: bool = False
+
     def search_artist(self, name: str) -> int | None:
         """
         Search Chartmetric for an artist by name.
 
         Returns the Chartmetric **numeric ID** of the best match, or
         ``None`` if the search fails or returns no results.
+
+        When rate-limited, skips the API call entirely and returns None
+        to avoid burning remaining quota.
         """
-        # Try the general search endpoint first
+        if self._search_rate_limited:
+            return None
+
         for search_path, parse_fn in [
             ("/api/search", self._parse_search_general),
             ("/api/artist/search", self._parse_search_artist),
@@ -600,7 +797,14 @@ class ChartmetricClient:
                 artists = parse_fn(data)
                 if artists:
                     return self._best_match(name, artists)
-            except ChartmetricAPIError:
+            except ChartmetricAPIError as exc:
+                exc_str = str(exc).lower()
+                if "429" in exc_str or "rate" in exc_str:
+                    logger.warning(
+                        "Search API rate-limited — disabling for this session"
+                    )
+                    self._search_rate_limited = True
+                    return None
                 continue
 
         logger.warning("Artist search found no results for '%s'", name)
@@ -885,7 +1089,6 @@ class ChartmetricClient:
         name: str,
         since: str = DEFAULT_HISTORY_START,
         use_cache: bool = True,
-        sigma_window: int | None = None,
     ) -> Dict[str, Any] | None:
         """
         Fetch a **full-history, multi-source** data package for one artist.
@@ -918,9 +1121,7 @@ class ChartmetricClient:
         if use_cache:
             fresh_df = self._try_load_fresh_cache(cm_id, name)
             if fresh_df is not None:
-                return self._build_scan_result(
-                    fresh_df, cm_id, name, sigma_window=sigma_window,
-                )
+                return self._build_scan_result(fresh_df, cm_id, name)
 
         # ── 2. Determine fetch range ─────────────────────────────────
         stale_cache = self._load_stale_cache(cm_id) if use_cache else None
@@ -938,6 +1139,7 @@ class ChartmetricClient:
 
         # ── 3. Fetch every source ────────────────────────────────────
         source_dfs: Dict[str, pd.DataFrame] = {}
+        api_failed_required = False
 
         for source, field, col_name, required in self._SCAN_SOURCES:
             source_key = f"{source}/{field or 'default'}"
@@ -990,14 +1192,15 @@ class ChartmetricClient:
                         source_dfs[col_name] = df
                     else:
                         logger.warning("  %s — no data for %s", name, col_name)
-                        return None
+                        api_failed_required = True
             except ChartmetricAPIError as exc:
                 if required:
                     logger.warning(
                         "  %s — required source %s failed: %s",
                         name, source, exc,
                     )
-                    return None
+                    api_failed_required = True
+                    break  # stop wasting API calls
                 exc_str = str(exc)
                 if any(code in exc_str for code in ("403", "404", "400")):
                     self._disabled_scan_sources.add(source_key)
@@ -1011,8 +1214,19 @@ class ChartmetricClient:
                         name, source_key, exc,
                     )
 
-        if "spotify_monthly_listeners" not in source_dfs:
-            logger.warning("  %s — no Spotify listener data", name)
+        # ── Fallback to stale cache when API fails ────────────────
+        if (api_failed_required or "spotify_monthly_listeners" not in source_dfs):
+            if stale_cache is not None and not stale_cache.empty:
+                logger.warning(
+                    "  %s — API failed but stale cache available "
+                    "(%d rows) — using cached data",
+                    name, len(stale_cache),
+                )
+                # Update TTL so we don't retry for a while
+                if use_cache:
+                    self._save_to_cache(cm_id, name, stale_cache)
+                return self._build_scan_result(stale_cache, cm_id, name)
+            logger.warning("  %s — no Spotify data and no cache", name)
             return None
 
         # ── 4. Merge all sources on Date ─────────────────────────────
@@ -1060,37 +1274,15 @@ class ChartmetricClient:
         if use_cache:
             self._save_to_cache(cm_id, name, merged)
 
-        return self._build_scan_result(
-            merged, cm_id, name, sigma_window=sigma_window,
-        )
-
-    # Default windows for multi-window sigma estimation.
-    # Uses the MAX sigma across several recent time scales to
-    # automatically capture event risk (album drops, viral moments)
-    # without including multi-year structural growth.
-    _SIGMA_WINDOWS = [90, 180, 365]
-    _SIGMA_FLOOR = 0.05   # minimum credible annualised vol
-    _SIGMA_CAP = 1.00     # maximum credible annualised vol (100%)
-                          # anything above is data corruption, not real volatility
+        return self._build_scan_result(merged, cm_id, name)
 
     def _build_scan_result(
         self,
         merged: pd.DataFrame,
         cm_id: int,
         name: str,
-        sigma_window: int | None = None,
     ) -> Dict[str, Any] | None:
-        """Build the enriched per-artist result dict from a merged DataFrame.
-
-        Parameters
-        ----------
-        sigma_window : int or None
-            If set, use only the last ``sigma_window`` days for sigma.
-            If None (default), use **multi-window estimation**: compute
-            sigma over 90d, 180d, and 365d windows and take the max.
-            This automatically captures event risk at any time scale
-            without including multi-year structural growth.
-        """
+        """Build the enriched per-artist result dict from a merged DataFrame."""
         import math
 
         if merged.empty or "spotify_monthly_listeners" not in merged.columns:
@@ -1100,34 +1292,20 @@ class ChartmetricClient:
         if "tiktok_sound_posts_change" not in merged.columns:
             merged = self._compute_velocity(merged)
 
-        # ── Per-artist sigma (multi-window, no range floor) ──────────
-        # Compute realized vol over several recent windows and take the
-        # MAX.  This adapts to each artist's recent dynamics: if they
-        # had an album drop 4 months ago, the 180d window catches it.
-        # If they've been quiet, the 365d window provides a baseline.
-        # No manual tuning — the data decides.
+        # ── Per-artist sigma ─────────────────────────────────────────
         listeners = merged["spotify_monthly_listeners"].astype(float)
+        pct_change = listeners.pct_change().dropna()
 
-        if sigma_window is not None:
-            # Explicit single window
-            windows = [sigma_window]
+        # Use the same estimator as Calibrator.compute_sigma():
+        # sample std of daily returns, annualised, with a 5% floor.
+        # The old range-implied estimator inflated sigma by 10x+ on
+        # multi-year history (it captured structural growth, not vol).
+        _SIGMA_FLOOR = 0.05
+        if not pct_change.empty and len(pct_change) >= 5:
+            sigma_sample = float(pct_change.std()) * math.sqrt(365)
+            sigma = max(sigma_sample, _SIGMA_FLOOR)
         else:
-            # Multi-window: use all windows that fit the data
-            windows = [w for w in self._SIGMA_WINDOWS if w < len(listeners)]
-            if not windows:
-                windows = [len(listeners)]
-
-        best_sigma = self._SIGMA_FLOOR
-        for w in windows:
-            recent = listeners.iloc[-w:]
-            pct_change = recent.pct_change().dropna()
-            if len(pct_change) >= 5:
-                s = float(pct_change.std()) * math.sqrt(365)
-                if s > best_sigma:
-                    best_sigma = s
-
-        sigma = max(best_sigma, self._SIGMA_FLOOR)
-        sigma = min(sigma, self._SIGMA_CAP)  # guard against data corruption
+            sigma = 0.20  # fallback
 
         # ── Latest values (from the last row of the merged DF) ───────
         latest = merged.iloc[-1]
@@ -1181,24 +1359,29 @@ class ChartmetricClient:
                     (latest_listeners - old) / old * 100, 2,
                 )
 
-        # ── Listener trend (14-day OLS slope) ────────────────────────
-        # More robust than point-to-point change_pct: fits a line
-        # through the last 14 days of daily listeners.  The slope
-        # (listeners gained per day) directly feeds the MC drift term.
-        listener_trend_daily = 0.0  # listeners/day
-        trend_window = min(14, len(listeners))
-        if trend_window >= 5:
-            recent_trend = listeners.iloc[-trend_window:].dropna()
-            if len(recent_trend) >= 5:
-                x = np.arange(len(recent_trend), dtype=np.float64)
-                y = recent_trend.values.astype(np.float64)
-                # OLS slope: Σ(x-x̄)(y-ȳ) / Σ(x-x̄)²
-                x_mean, y_mean = x.mean(), y.mean()
-                ss_xx = float(np.sum((x - x_mean) ** 2))
-                if ss_xx > 0:
-                    listener_trend_daily = float(
-                        np.sum((x - x_mean) * (y - y_mean)) / ss_xx
-                    )
+        # Event impact score (from release calendar if available)
+        event_impact = 1.0
+        if "event_impact_score" in merged.columns:
+            # Check the latest 3 days for any upcoming event
+            recent = merged.tail(3)
+            event_impact = float(recent["event_impact_score"].max())
+
+        # ── Trend: annualised EWMA growth rate from last 7 days ──────
+        # Computed directly from cached data — zero API calls.
+        # This gives the MC-OU simulation "memory" of recent trajectory.
+        trend = 0.0
+        if len(listeners) >= 8:
+            recent_listeners = listeners.tail(8)
+            log_rets = np.log(
+                recent_listeners / recent_listeners.shift(1)
+            ).dropna()
+            log_rets = log_rets[np.isfinite(log_rets)]
+            if len(log_rets) >= 2:
+                ewma_daily = float(log_rets.ewm(span=7).mean().iloc[-1])
+                trend = float(np.clip(ewma_daily * 365, -2.0, 2.0))
+
+        # ── Composite momentum score from ALL cross-platform signals ──
+        momentum = compute_momentum(merged)
 
         # Playlist reach (best effort)
         playlist_data = self.get_artist_playlist_reach(cm_id)
@@ -1209,11 +1392,13 @@ class ChartmetricClient:
             "df": merged,
             "listeners": latest_listeners,
             "change_pct": change_pct,
-            "listener_trend_daily": round(listener_trend_daily, 1),
             "sigma": round(sigma, 6),
             "tiktok_velocity": latest_velocity,
             "tiktok_p95": tiktok_p95,
             "norm_velocity": round(norm_velocity, 4),
+            "event_impact_score": event_impact,
+            "trend": round(trend, 6),
+            "momentum": round(momentum, 4),
             "spotify_followers": latest_followers,
             "spotify_popularity": latest_popularity,
             "youtube_views": latest_youtube,
@@ -1234,7 +1419,6 @@ class ChartmetricClient:
         artist_names: List[str],
         since: str = DEFAULT_HISTORY_START,
         use_cache: bool = True,
-        sigma_window: int | None = None,
     ) -> List[Dict[str, Any]]:
         """
         Resolve and fetch **consistent** multi-source data for every
@@ -1299,7 +1483,6 @@ class ChartmetricClient:
             try:
                 data = self.get_artist_scan_data(
                     cm_id, name, since=since, use_cache=use_cache,
-                    sigma_window=sigma_window,
                 )
             except ChartmetricAPIError as exc:
                 logger.warning(
@@ -1349,6 +1532,120 @@ class ChartmetricClient:
             len(results), n_artists, "ON" if use_cache else "OFF",
         )
         return results
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Data-First Discovery: Top Artists by Listeners
+    # ═════════════════════════════════════════════════════════════════════
+
+    def discover_top_artists(
+        self,
+        top_n: int = 15,
+        extra_names: List[str] | None = None,
+        since: str = DEFAULT_HISTORY_START,
+        use_cache: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        **Data-first** artist discovery: identify the top artists by
+        current Spotify Monthly Listeners, using Chartmetric as the
+        sole source of truth.
+
+        This is the inverse of the old flow (which started from Kalshi
+        market data).  Now the model discovers the field independently:
+
+        1.  Check the local Parquet cache for previously scanned artists.
+        2.  Merge with the global seed list (``TOP_GLOBAL_ARTISTS_SEED``).
+        3.  Merge any ``extra_names`` (e.g. from a Kalshi market).
+        4.  Resolve names → Chartmetric IDs → fetch full scan data.
+        5.  Sort by current monthly listeners descending.
+        6.  Return the top ``top_n`` artists with full enriched data.
+
+        The result is a list of artist dicts identical in format to
+        ``get_all_artists_scan_data()`` — ready for MC-OU pricing.
+
+        Parameters
+        ----------
+        top_n : int
+            Number of top artists to return (default 15).
+        extra_names : list of str, optional
+            Additional artist names to include (e.g. from Kalshi).
+        since : str
+            History start date for full-data fetch.
+        use_cache : bool
+            Whether to use local Parquet cache (6h TTL).
+
+        Returns
+        -------
+        list of dict
+            Top artists sorted by listeners descending.
+        """
+        logger.info("=" * 64)
+        logger.info("DATA-FIRST DISCOVERY — Top artists by Chartmetric listeners")
+        logger.info("=" * 64)
+
+        # ── 1. Build the candidate set from all sources ───────────────
+        candidates: Dict[str, int | None] = {}  # name → cm_id or None
+
+        # 1a. From the seed list
+        for entry in TOP_GLOBAL_ARTISTS_SEED:
+            name = entry["name"]
+            cm_id = entry.get("cm_id")
+            candidates[name] = cm_id
+
+        # 1b. From the cache manifest (previously scanned artists)
+        manifest = self._load_manifest()
+        for cm_id_str, meta in manifest.items():
+            name = meta.get("name", "")
+            if name and name not in candidates:
+                candidates[name] = int(cm_id_str)
+
+        # 1c. From extra_names (e.g. Kalshi market artists)
+        if extra_names:
+            for name in extra_names:
+                if name not in candidates:
+                    candidates[name] = None
+
+        logger.info(
+            "Candidate pool: %d artists (%d seeded, %d cached, %d extra)",
+            len(candidates),
+            len(TOP_GLOBAL_ARTISTS_SEED),
+            len(manifest),
+            len(extra_names or []),
+        )
+
+        # ── 2. Build name list (put known cm_ids first for efficiency) ─
+        ordered: List[tuple[str, int | None]] = sorted(
+            candidates.items(),
+            key=lambda x: (x[1] is None, x[0]),  # known IDs first
+        )
+
+        all_names = [name for name, _ in ordered]
+
+        # ── 3. Fetch enriched data for all candidates ─────────────────
+        print(f"\n  Discovering top artists from Chartmetric ({len(all_names)} candidates)...")
+        print(f"  Cache: {'ON (6h TTL)' if use_cache else 'OFF'}")
+
+        all_artists = self.get_all_artists_scan_data(
+            all_names, since=since, use_cache=use_cache,
+        )
+
+        if not all_artists:
+            logger.warning("No artists resolved from Chartmetric")
+            return []
+
+        # ── 4. Sort by listeners and return top N ─────────────────────
+        all_artists.sort(key=lambda a: a["listeners"], reverse=True)
+        top = all_artists[:top_n]
+
+        logger.info(
+            "Data-first discovery complete: %d/%d resolved, top %d selected",
+            len(all_artists), len(all_names), len(top),
+        )
+        print(f"\n  Top {len(top)} artists by Spotify Monthly Listeners:")
+        for i, a in enumerate(top, 1):
+            chg = f"{a['change_pct']:+.1f}%" if a.get("change_pct") is not None else "—"
+            print(f"    {i:>2d}. {a['name']:<25s}  {a['listeners']:>15,d}  ({chg} 7d)")
+
+        return top
 
     # ═════════════════════════════════════════════════════════════════════
     #  Spotify Playlist Reach
@@ -1740,13 +2037,16 @@ class ChartmetricClient:
         raw_diff = cumul.diff().fillna(0)
         clamped = raw_diff.clip(lower=0)
 
-        mean_val = clamped.mean()
-        std_val = clamped.std()
-        if std_val > 0:
-            threshold = mean_val + 3 * std_val
-            rolling_med = clamped.rolling(window=7, min_periods=1).median()
-            outlier_mask = clamped > threshold
-            clamped = clamped.where(~outlier_mask, rolling_med)
+        # Winsorize at P99.5 instead of the old mean+3σ hard cap.
+        # The old approach replaced genuine viral spikes (the alpha
+        # signal) with the rolling median, destroying the information
+        # the entire strategy depends on.  P99.5 winsorization
+        # compresses only the most extreme glitches (data errors)
+        # while preserving real viral events.
+        if len(clamped) > 10:
+            p995 = float(clamped.quantile(0.995))
+            if p995 > 0:
+                clamped = clamped.clip(upper=p995)
 
         ema = clamped.ewm(span=3, adjust=False).mean()
         df["tiktok_sound_posts_change"] = ema

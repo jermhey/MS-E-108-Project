@@ -633,6 +633,7 @@ def run_stress_tests(
     df_b = df.copy()
     inject_idx = max(30, len(df_b) // 2)
 
+    spike_date = drop_date = None
     if inject_idx + 1 < len(df_b):
         baseline = float(df_b["tiktok_sound_posts_change"].iloc[inject_idx])
         if baseline <= 0:
@@ -658,11 +659,11 @@ def run_stress_tests(
         spike_signal = next(
             (s.signal for s in res_b.snapshots if s.date == spike_date),
             "N/A",
-        )
+        ) if spike_date else "N/A"
         drop_signal = next(
             (s.signal for s in res_b.snapshots if s.date == drop_date),
             "N/A",
-        )
+        ) if drop_date else "N/A"
 
         kpis_b["passed"] = True
         kpis_b["spike_date"] = spike_date
