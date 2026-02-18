@@ -239,10 +239,14 @@ def load_data_from_api(settings: Settings) -> pd.DataFrame:
     if cm_id is not None and not df.empty:
         latest_date = pd.to_datetime(df["Date"]).max()
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=7)
+        if latest_date.tzinfo is None:
+            latest_date = pd.Timestamp(latest_date).tz_localize("UTC")
         if latest_date < cutoff:
             cached_df = client._load_stale_cache(cm_id)
             if cached_df is not None and not cached_df.empty:
                 cached_latest = pd.to_datetime(cached_df["Date"]).max()
+                if cached_latest.tzinfo is None:
+                    cached_latest = pd.Timestamp(cached_latest).tz_localize("UTC")
                 if cached_latest > latest_date:
                     logger.warning(
                         "API returned stale data (ends %s) — using CACHED data "
