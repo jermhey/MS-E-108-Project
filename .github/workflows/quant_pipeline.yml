@@ -7,11 +7,25 @@
 #
 #  The signal loop runs continuously (every 60s) inside a single job,
 #  restarting every ~5.5 hours to stay under GitHub's 6-hour limit.
+#  On restart, the executor reconciles local state against the Kalshi
+#  API, so no positions or orders are lost.
+#
+#  Modes:
+#    - Push to main → DRY-RUN (CI verification, no real orders)
+#    - Cron / manual dispatch → LIVE MARKET-MAKING (real orders on Kalshi)
+#
+#  Risk controls (hardcoded in risk_manager.py):
+#    - Max 10% daily loss circuit breaker
+#    - Max 25 contracts per order
+#    - Max 50 contracts per ticker
+#    - $10 minimum balance floor
+#    - All orders placed with post_only=True (maker fees only)
+#    - 8c default half-spread (net profitable after 1.5c/fill fee)
 #
 #  Triggers:
 #    - Cron: every 6 hours (restarts the long-running loop)
-#    - Push to main (CI: tests + one signal cycle)
-#    - Manual dispatch (on-demand)
+#    - Push to main (CI: tests + one dry-run signal cycle)
+#    - Manual dispatch (on-demand, live trading)
 #
 #  Secrets required (set in GitHub → Settings → Secrets → Actions):
 #    - KALSHI_ACCESS_KEY
@@ -61,7 +75,7 @@ jobs:
         run: python -m pytest tests/ -v --tb=short
 
   # ═══════════════════════════════════════════════════════════════════════════
-  #  JOB 2: Live Signal Loop (belief-only, Kalshi data only)
+  #  JOB 2: Live Market-Making Loop (belief-only, Kalshi data only)
   # ═══════════════════════════════════════════════════════════════════════════
   signal:
     needs: test
@@ -97,9 +111,18 @@ jobs:
           restore-keys: |
             kalshi-hf-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-
 
+      # ── Restore position/order state from previous runs ──────────
+      - name: Restore executor state
+        uses: actions/cache@v4
+        with:
+          path: tauroi-prediction-engine/state/
+          key: executor-state-${{ github.run_id }}
+          restore-keys: |
+            executor-state-
+
       # ── Run the belief-only signal loop ──────────────────────────
-      # On push events: single run (CI verification)
-      # On schedule/dispatch: loop every 60s for up to 5.5 hours
+      # Push events → DRY-RUN (CI verification, no real orders)
+      # Schedule/dispatch → LIVE MARKET-MAKING (real orders)
       - name: Run belief signal engine
         timeout-minutes: 340
         env:
@@ -107,11 +130,18 @@ jobs:
           KALSHI_API_SECRET: ${{ secrets.KALSHI_API_SECRET }}
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "CI mode: single belief run"
+            echo "CI mode: single dry-run belief cycle"
             python main.py --belief --scan --dry-run
           else
-            echo "Loop mode: belief scan every 60s (max 330 min)"
-            timeout 19800 python main.py --belief --scan --dry-run --loop --interval 60 || true
+            echo "LIVE MARKET-MAKING: belief scan every 60s (max 330 min)"
+            echo "Half-spread: 8c | Max order: 25 | Max daily loss: 10%"
+            timeout 19800 python main.py \
+              --belief --scan --live --market-making \
+              --mm-spread 8 \
+              --max-order-size 10 \
+              --max-daily-loss 0.10 \
+              --loop --interval 60 \
+              || true
           fi
 
       - name: Upload signal log as artifact
@@ -120,6 +150,14 @@ jobs:
         with:
           name: signal-log-${{ github.run_id }}
           path: tauroi-prediction-engine/signals/signal_log.jsonl
+          retention-days: 90
+
+      - name: Upload executor state as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executor-state-${{ github.run_id }}
+          path: tauroi-prediction-engine/state/
           retention-days: 90
 
       - name: Commit signal log to repo

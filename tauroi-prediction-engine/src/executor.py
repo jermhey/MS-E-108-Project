@@ -30,8 +30,8 @@ logger = get_logger("tauroi.executor")
 STALE_ORDER_DRIFT_CENTS = 3
 
 # Default half-spread for market-making mode (cents).
-# A 2c half-spread means we buy at fair-2c and sell at fair+2c.
-DEFAULT_MM_HALF_SPREAD_CENTS = 2
+# Backtest shows net profitability at ≥8c after 1.5c/fill maker fee.
+DEFAULT_MM_HALF_SPREAD_CENTS = 8
 
 
 class OrderExecutor:
@@ -55,7 +55,7 @@ class OrderExecutor:
         If True, place two-sided quotes around fair value instead of
         directional orders (default False).
     mm_half_spread_cents : int
-        Half-spread for market-making mode (default 2c).
+        Half-spread for market-making mode (default 8c).
     """
 
     def __init__(

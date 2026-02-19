@@ -38,9 +38,11 @@ MEAN_REV_BOOST = 1.5        # size multiplier when mean-reversion agrees
 BASELINE_SIGMA_B = 0.80
 
 # Minimum / maximum dynamic spread in cents
-MIN_SPREAD_CENTS = 2
-MAX_SPREAD_CENTS = 10
-BASE_SPREAD_CENTS = 3
+# Backtest (mm_backtest.ipynb) shows net profitability requires ≥8c
+# half-spread after Kalshi's 1.5c/fill maker fee.
+MIN_SPREAD_CENTS = 5
+MAX_SPREAD_CENTS = 15
+BASE_SPREAD_CENTS = 8
 
 
 def _compute_dynamic_spread(cal: BeliefCalibration) -> int:

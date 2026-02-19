@@ -1033,7 +1033,7 @@ def run(
     max_order_size: int = 25,
     max_daily_loss: float = 0.10,
     market_making: bool = False,
-    mm_half_spread_cents: int = 2,
+    mm_half_spread_cents: int = 8,
     hybrid: bool = False,
     belief: bool = False,
 ) -> None:
@@ -1260,7 +1260,7 @@ def _run_scan_pipeline(
     max_order_size: int = 25,
     max_daily_loss: float = 0.10,
     market_making: bool = False,
-    mm_half_spread_cents: int = 2,
+    mm_half_spread_cents: int = 8,
     hybrid: bool = False,
     belief: bool = False,
 ) -> list[Dict[str, Any]]:
@@ -1439,7 +1439,7 @@ def _execute_scan_signals(
     max_order_size: int,
     max_daily_loss: float,
     market_making: bool = False,
-    mm_half_spread_cents: int = 2,
+    mm_half_spread_cents: int = 8,
 ) -> None:
     """Send scan signals through the live execution pipeline."""
     from src.kalshi_client import KalshiClient
@@ -1547,7 +1547,7 @@ def _run_belief_only(
     max_order_size: int = 25,
     max_daily_loss: float = 0.10,
     market_making: bool = False,
-    mm_half_spread_cents: int = 2,
+    mm_half_spread_cents: int = 8,
 ) -> None:
     """
     Pure belief-model pipeline — uses **only Kalshi data**.
@@ -1844,8 +1844,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mm-spread",
         type=int,
-        default=2,
-        help="Half-spread in cents for market-making mode (default: 2).",
+        default=8,
+        help="Half-spread in cents for market-making mode (default: 8).",
     )
 
     # ── Belief model modes ──────────────────────────────────────────
