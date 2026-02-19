@@ -1561,8 +1561,9 @@ def _run_belief_only(
     5. Generate pure-belief signals (Kalman fair value + mean-rev).
     6. Execute (live) or log (dry-run).
     """
+    import warnings
     from src.kalshi_client import KalshiClient
-    from src.belief_data import discover_tickers, fetch_hf_data
+    from src.belief_data import discover_tickers, fetch_hf_data, MIN_TRADES_FOR_SIGNAL
     from src.belief_model import calibrate_belief
     from src.hybrid_signal import generate_pure_belief_signals
 
@@ -1596,28 +1597,36 @@ def _run_belief_only(
         print(f"    {t['ticker']:40s}  {t['title']}")
     print()
 
-    # ── Step 2: Fetch HF trade data ──────────────────────────────
+    # ── Step 2: Fetch HF trade data (incremental) ────────────────
     hf_data: Dict[str, pd.DataFrame] = {}
     for info in open_tickers:
         tkr = info["ticker"]
         try:
             hf_df = fetch_hf_data(kalshi, tkr, prefer_trades=True)
-            if not hf_df.empty:
+            if not hf_df.empty and len(hf_df) >= MIN_TRADES_FOR_SIGNAL:
                 hf_data[tkr] = hf_df
+            elif not hf_df.empty:
+                logger.debug(
+                    "Skipping %s: only %d trades (need %d)",
+                    tkr, len(hf_df), MIN_TRADES_FOR_SIGNAL,
+                )
         except Exception as exc:
             logger.warning("HF fetch failed for %s: %s", tkr, exc)
 
-    logger.info("HF data loaded for %d / %d tickers", len(hf_data), len(open_tickers))
-    print(f"  HF data: {len(hf_data)} tickers, "
+    logger.info("HF data loaded for %d / %d tickers (min %d trades)",
+                len(hf_data), len(open_tickers), MIN_TRADES_FOR_SIGNAL)
+    print(f"  HF data: {len(hf_data)} tickers with >= {MIN_TRADES_FOR_SIGNAL} trades, "
           f"{sum(len(df) for df in hf_data.values()):,} total trades")
 
     # ── Step 3: Calibrate belief model ───────────────────────────
     belief_cals: Dict[str, Any] = {}
-    for tkr, hf_df in hf_data.items():
-        try:
-            belief_cals[tkr] = calibrate_belief(hf_df, ticker=tkr)
-        except Exception as exc:
-            logger.warning("Calibration failed for %s: %s", tkr, exc)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for tkr, hf_df in hf_data.items():
+            try:
+                belief_cals[tkr] = calibrate_belief(hf_df, ticker=tkr)
+            except Exception as exc:
+                logger.warning("Calibration failed for %s: %s", tkr, exc)
 
     logger.info("Calibrated %d / %d tickers", len(belief_cals), len(hf_data))
 

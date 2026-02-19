@@ -713,11 +713,20 @@ class KalshiClient:
         ticker: str,
         limit: int = 1000,
         cursor: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
     ) -> tuple[list[Dict[str, Any]], str | None]:
         """
         Fetch recent trades for a market.
 
         Endpoint: GET /markets/trades
+
+        Parameters
+        ----------
+        min_ts : int, optional
+            Only return trades after this Unix timestamp (seconds).
+        max_ts : int, optional
+            Only return trades before this Unix timestamp (seconds).
 
         Returns (trades_list, next_cursor).
         """
@@ -727,6 +736,10 @@ class KalshiClient:
         }
         if cursor:
             params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
 
         data = self._request("GET", "/markets/trades", params=params)
         trades = data.get("trades", [])

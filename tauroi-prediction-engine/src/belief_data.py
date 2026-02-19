@@ -2,14 +2,15 @@
 belief_data.py — High-Frequency Kalshi Data Fetcher
 =====================================================
 Fetches tick-level trades and 1-minute candlesticks for KXTOPMONTHLY
-contracts, with Parquet caching to avoid redundant API calls.
+contracts, with Parquet caching and **incremental fetching** to avoid
+redundant API calls on tight polling loops.
 """
 
 from __future__ import annotations
 
 import pathlib
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,8 @@ _CACHE_DIR = _PROJECT_ROOT / "cache" / "kalshi_hf"
 PRICE_CLIP_LO = 0.01
 PRICE_CLIP_HI = 0.99
 
+MIN_TRADES_FOR_SIGNAL = 15
+
 
 def _ensure_cache_dir() -> pathlib.Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,30 +39,10 @@ def _cache_path(ticker: str, kind: str) -> pathlib.Path:
     return _ensure_cache_dir() / f"{safe}_{kind}.parquet"
 
 
-# ── Tick-Level Trades ────────────────────────────────────────────────────────
-
-def fetch_trades(
-    client: KalshiClient,
-    ticker: str,
-    max_pages: int = 30,
-    delay: float = 0.12,
-) -> pd.DataFrame:
-    """Paginate through all trades for *ticker* and return a DataFrame."""
-    all_trades: List[Dict[str, Any]] = []
-    cursor: str | None = None
-
-    for _ in range(max_pages):
-        trades, cursor = client.get_market_trades(ticker, limit=1000, cursor=cursor)
-        all_trades.extend(trades)
-        if not cursor or not trades:
-            break
-        time.sleep(delay)
-
-    if not all_trades:
-        return pd.DataFrame(columns=["timestamp", "mid_price", "volume"])
-
+def _parse_trades(raw_trades: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Convert raw API trade dicts into a clean DataFrame."""
     rows = []
-    for t in all_trades:
+    for t in raw_trades:
         ts_str = t.get("created_time", "")
         price_cents = t.get("yes_price", t.get("price", 0))
         vol = t.get("count", t.get("volume", 1))
@@ -71,14 +54,44 @@ def fetch_trades(
             "volume": int(vol),
         })
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "mid_price", "volume", "logit"])
 
+    df = pd.DataFrame(rows)
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["mid_price"] = df["mid_price"].clip(PRICE_CLIP_LO, PRICE_CLIP_HI)
     df["logit"] = np.log(df["mid_price"] / (1.0 - df["mid_price"]))
     return df
+
+
+# ── Tick-Level Trades ────────────────────────────────────────────────────────
+
+def fetch_trades(
+    client: KalshiClient,
+    ticker: str,
+    max_pages: int = 30,
+    delay: float = 0.12,
+    min_ts: int | None = None,
+) -> pd.DataFrame:
+    """
+    Paginate through trades for *ticker*.
+
+    If *min_ts* is given, only fetches trades after that Unix timestamp,
+    enabling fast incremental updates.
+    """
+    all_trades: List[Dict[str, Any]] = []
+    cursor: str | None = None
+
+    for _ in range(max_pages):
+        trades, cursor = client.get_market_trades(
+            ticker, limit=1000, cursor=cursor, min_ts=min_ts,
+        )
+        all_trades.extend(trades)
+        if not cursor or not trades:
+            break
+        time.sleep(delay)
+
+    return _parse_trades(all_trades)
 
 
 # ── 1-Minute Candlesticks ───────────────────────────────────────────────────
@@ -92,7 +105,6 @@ def fetch_candles_1m(
     now_ts = int(time.time())
     start_ts = now_ts - lookback_days * 86400
 
-    # Kalshi may limit the window per request; chunk into 7-day windows.
     frames: List[pd.DataFrame] = []
     chunk = 7 * 86400
 
@@ -136,7 +148,7 @@ def fetch_candles_1m(
     return df
 
 
-# ── Unified Fetcher with Caching ────────────────────────────────────────────
+# ── Unified Fetcher with Incremental Caching ────────────────────────────────
 
 def fetch_hf_data(
     client: KalshiClient,
@@ -145,10 +157,12 @@ def fetch_hf_data(
     use_cache: bool = True,
 ) -> pd.DataFrame:
     """
-    Fetch the highest-frequency data available for *ticker*.
+    Fetch HF data with **incremental updates**.
 
-    Tries tick-level trades first (finest granularity).  Falls back to
-    1-minute candles if trade data is sparse.  Caches results as Parquet.
+    On the first call (cold cache), fetches everything.  On subsequent
+    calls, only fetches trades newer than the latest cached timestamp,
+    then merges.  This keeps each loop iteration fast (~1 API call per
+    ticker instead of 10-20).
     """
     kind = "trades" if prefer_trades else "candles1m"
     cache = _cache_path(ticker, kind)
@@ -157,12 +171,20 @@ def fetch_hf_data(
     if use_cache and cache.exists():
         try:
             cached = pd.read_parquet(cache)
-            logger.info("Cache hit for %s (%s): %d rows", ticker, kind, len(cached))
         except Exception:
             cached = None
 
     if prefer_trades:
-        fresh = fetch_trades(client, ticker)
+        min_ts: int | None = None
+        if cached is not None and not cached.empty:
+            latest = pd.to_datetime(cached["timestamp"]).max()
+            min_ts = int(latest.timestamp()) + 1
+            logger.debug(
+                "Incremental fetch for %s: trades after %s",
+                ticker, latest.isoformat(),
+            )
+
+        fresh = fetch_trades(client, ticker, min_ts=min_ts)
     else:
         fresh = fetch_candles_1m(client, ticker)
 
@@ -174,10 +196,21 @@ def fetch_hf_data(
     else:
         df = fresh
 
+    # Recompute logit in case it was missing from old cache
+    if not df.empty and "logit" not in df.columns:
+        df["mid_price"] = df["mid_price"].clip(PRICE_CLIP_LO, PRICE_CLIP_HI)
+        df["logit"] = np.log(df["mid_price"] / (1.0 - df["mid_price"]))
+
     if not df.empty and use_cache:
         df.to_parquet(cache, index=False)
 
-    logger.info("HF data for %s: %d rows (%s)", ticker, len(df), kind)
+    n_new = len(fresh) if not fresh.empty else 0
+    n_total = len(df)
+    if n_new > 0:
+        logger.info("HF %s: %d new trades, %d total", ticker, n_new, n_total)
+    else:
+        logger.info("HF %s: no new trades (%d cached)", ticker, n_total)
+
     return df
 
 
@@ -193,8 +226,6 @@ def discover_tickers(client: KalshiClient) -> List[Dict[str, Any]]:
             event_ticker = ev.get("event_ticker", "")
             markets = ev.get("markets", [])
             if not markets:
-                # Events endpoint may not include nested markets;
-                # fetch the single event with nested markets.
                 try:
                     full_ev = client.get_event(event_ticker)
                     markets = full_ev.get("markets", [])
