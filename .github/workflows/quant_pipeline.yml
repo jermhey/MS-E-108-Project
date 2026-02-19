@@ -1,35 +1,31 @@
 ###############################################################################
 #  Tauroi Technologies — Quant Pipeline (Production)
 #
-#  This workflow IS the live trading signal engine. It runs on a schedule,
-#  fetches real-time data from Chartmetric + Kalshi, computes the model
-#  fair value, and persists the signal to signals/signal_log.jsonl.
+#  Pure belief-model pipeline: uses ONLY Kalshi price data.
+#  No Chartmetric dependency — the logit jump-diffusion model operates
+#  entirely on tick-level trade history from Kalshi.
 #
-#  IMPORTANT: The application lives in the tauroi-prediction-engine/
-#  subdirectory.  All pip / python / path references use that as the
-#  working-directory.
+#  The signal loop runs continuously (every 60s) inside a single job,
+#  restarting every ~5.5 hours to stay under GitHub's 6-hour limit.
 #
 #  Triggers:
-#    - Cron: every hour (live market monitoring — respects Chartmetric rate limits)
-#    - Push to main/dev (CI: tests + signal generation)
-#    - Manual dispatch (on-demand signal check)
+#    - Cron: every 6 hours (restarts the long-running loop)
+#    - Push to main (CI: tests + one signal cycle)
+#    - Manual dispatch (on-demand)
 #
 #  Secrets required (set in GitHub → Settings → Secrets → Actions):
 #    - KALSHI_ACCESS_KEY
 #    - KALSHI_API_SECRET
-#    - CHARTMETRIC_REFRESH_TOKEN
-#    - CHARTMETRIC_ARTIST_ID       (optional, defaults to 214945)
-#    - ARTIST_NAME                 (optional, defaults to "Bad Bunny")
 ###############################################################################
 
 name: Quant Pipeline
 
 on:
   push:
-    branches: ["main", "dev"]
+    branches: ["main"]
   schedule:
-    - cron: "0 * * * *"           # every hour (top of the hour)
-  workflow_dispatch:              # allow manual runs from the Actions tab
+    - cron: "0 */6 * * *"          # every 6 hours (restarts the loop)
+  workflow_dispatch:                # manual runs from the Actions tab
 
 # Prevent concurrent runs from overlapping
 concurrency:
@@ -65,7 +61,7 @@ jobs:
         run: python -m pytest tests/ -v --tb=short
 
   # ═══════════════════════════════════════════════════════════════════════════
-  #  JOB 2: Live Signal Generation (runs after tests pass)
+  #  JOB 2: Live Signal Loop (belief-only, Kalshi data only)
   # ═══════════════════════════════════════════════════════════════════════════
   signal:
     needs: test
@@ -73,8 +69,6 @@ jobs:
     permissions:
       contents: write           # required for git push (signal log commit)
 
-    # Only run the live engine if secrets are configured
-    # (forks / PRs won't have them)
     if: |
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -94,26 +88,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── Restore Chartmetric data cache from previous runs ──────────
-      # This avoids re-fetching full history on every run (prevents
-      # rate limiting). The cache key rolls with run_id so every run
-      # can write back; restore-keys lets it pick up the most recent.
-      - name: Restore Chartmetric data cache
+      # ── Restore HF data cache from previous runs ─────────────────
+      - name: Restore Kalshi HF data cache
         uses: actions/cache@v4
         with:
           path: tauroi-prediction-engine/cache/
-          key: chartmetric-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-${{ github.run_id }}
+          key: kalshi-hf-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-${{ github.run_id }}
           restore-keys: |
-            chartmetric-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-
+            kalshi-hf-cache-${{ hashFiles('tauroi-prediction-engine/requirements.txt') }}-
 
-      - name: Run live signal engine (full market scan)
+      # ── Run the belief-only signal loop ──────────────────────────
+      # On push events: single run (CI verification)
+      # On schedule/dispatch: loop every 60s for up to 5.5 hours
+      - name: Run belief signal engine
+        timeout-minutes: 340
         env:
           KALSHI_ACCESS_KEY: ${{ secrets.KALSHI_ACCESS_KEY }}
           KALSHI_API_SECRET: ${{ secrets.KALSHI_API_SECRET }}
-          CHARTMETRIC_REFRESH_TOKEN: ${{ secrets.CHARTMETRIC_REFRESH_TOKEN }}
-          CHARTMETRIC_ARTIST_ID: ${{ secrets.CHARTMETRIC_ARTIST_ID || '214945' }}
-          ARTIST_NAME: ${{ secrets.ARTIST_NAME || 'Bad Bunny' }}
-        run: python main.py --scan --dry-run
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "CI mode: single belief run"
+            python main.py --belief --scan --dry-run
+          else
+            echo "Loop mode: belief scan every 60s (max 330 min)"
+            timeout 19800 python main.py --belief --scan --dry-run --loop --interval 60 || true
+          fi
 
       - name: Upload signal log as artifact
         if: always()
@@ -125,13 +124,11 @@ jobs:
 
       - name: Commit signal log to repo
         if: success()
-        # This step must run at the repo root for git commands
         working-directory: .
         run: |
           git config user.name "Tauroi Bot"
           git config user.email "bot@tauroi.dev"
           git add tauroi-prediction-engine/signals/signal_log.jsonl
-          # Only commit if there are changes
           git diff --cached --quiet || \
             git commit -m "signal: $(date -u '+%Y-%m-%d %H:%M UTC')" && \
             git push

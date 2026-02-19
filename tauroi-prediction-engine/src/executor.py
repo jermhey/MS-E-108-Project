@@ -4,6 +4,11 @@ executor.py — Order Execution Engine
 Translates trading signals into Kalshi limit orders, manages the
 order lifecycle (place, amend, cancel stale), and tracks fills.
 
+Supports two modes:
+  - **Directional**: one-sided orders based on edge sign.
+  - **Market-Making**: two-sided quoting around fair value to earn
+    the bid-ask spread with maker fees.
+
 This module ties together the KalshiClient, RiskManager, and
 PositionStore into a coherent execution pipeline.
 """
@@ -24,6 +29,10 @@ logger = get_logger("tauroi.executor")
 # current model fair value before we cancel and replace.
 STALE_ORDER_DRIFT_CENTS = 3
 
+# Default half-spread for market-making mode (cents).
+# A 2c half-spread means we buy at fair-2c and sell at fair+2c.
+DEFAULT_MM_HALF_SPREAD_CENTS = 2
+
 
 class OrderExecutor:
     """
@@ -42,6 +51,11 @@ class OrderExecutor:
         Base position size as % of available cash (default 2%).
     max_conviction_units : int
         Maximum conviction multiplier (default 3 = 6% max).
+    market_making : bool
+        If True, place two-sided quotes around fair value instead of
+        directional orders (default False).
+    mm_half_spread_cents : int
+        Half-spread for market-making mode (default 2c).
     """
 
     def __init__(
@@ -51,12 +65,16 @@ class OrderExecutor:
         store: PositionStore,
         base_unit_pct: float = 0.02,
         max_conviction_units: int = 3,
+        market_making: bool = False,
+        mm_half_spread_cents: int = DEFAULT_MM_HALF_SPREAD_CENTS,
     ) -> None:
         self.kalshi = kalshi
         self.risk = risk
         self.store = store
         self.base_unit_pct = base_unit_pct
         self.max_conviction_units = max_conviction_units
+        self.market_making = market_making
+        self.mm_half_spread_cents = mm_half_spread_cents
 
         self._balance_cents: int = 0
         self._positions: List[Dict[str, Any]] = []
@@ -314,6 +332,99 @@ class OrderExecutor:
 
         return result
 
+    # ── Market-Making Execution ──────────────────────────────────────
+
+    def process_market_making_signal(
+        self,
+        ticker: str,
+        fair_value: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Place two-sided quotes around the model fair value.
+
+        Posts a resting BUY-YES at ``fair - half_spread`` and a
+        resting BUY-NO (sell YES) at ``fair + half_spread``, both
+        with ``post_only=True`` for maker fees.
+
+        Returns a list of result dicts (one per side attempted).
+        """
+        results: List[Dict[str, Any]] = []
+        hs = self.mm_half_spread_cents
+        fair_cents = int(round(fair_value * 100))
+
+        bid_cents = max(1, fair_cents - hs)
+        ask_cents = min(99, fair_cents + hs)
+
+        if bid_cents >= ask_cents:
+            results.append({
+                "ticker": ticker, "action": "mm_skip", "status": "skipped",
+                "reason": f"spread collapsed: bid={bid_cents}c ask={ask_cents}c",
+            })
+            return results
+
+        base_size = max(1, int(
+            (self._balance_cents / 100) * self.base_unit_pct / (fair_cents / 100)
+        )) if self._balance_cents > 0 and fair_cents > 0 else 1
+
+        for side, action, price_cents, label in [
+            ("yes", "buy", bid_cents, "mm_bid"),
+            ("no", "buy", 100 - ask_cents, "mm_ask"),
+        ]:
+            existing = self.store.get_resting_order_for_ticker(ticker, side)
+            if existing:
+                drift = abs(price_cents - existing.get("price_cents", 0))
+                if drift <= STALE_ORDER_DRIFT_CENTS:
+                    results.append({
+                        "ticker": ticker, "action": label, "status": "skipped",
+                        "reason": f"resting {side} order still fresh (drift {drift}c)",
+                    })
+                    continue
+                oid = existing.get("order_id", "")
+                try:
+                    self.kalshi.cancel_order(oid)
+                    self.store.remove_order(oid, reason="mm_requote")
+                except KalshiAPIError as exc:
+                    logger.warning("MM cancel failed %s: %s", oid, exc)
+
+            proposal = TradeProposal(
+                ticker=ticker, side=side, action=action,
+                count=base_size, price_cents=price_cents,
+                edge_cents=hs, fair_value=fair_value,
+                market_price=fair_value,
+            )
+            decision = self.risk.check(proposal, self._balance_cents, self._positions)
+
+            if not decision.approved:
+                results.append({
+                    "ticker": ticker, "action": label, "status": "rejected",
+                    "reason": decision.reason,
+                })
+                continue
+
+            try:
+                order = self.kalshi.place_order(
+                    ticker=ticker, side=side, action=action,
+                    count=base_size, price_cents=price_cents, post_only=True,
+                )
+                self.store.track_order(order)
+                results.append({
+                    "ticker": ticker, "action": label, "status": "placed",
+                    "reason": f"order {order.get('order_id', '?')}",
+                    "order": order,
+                })
+                logger.info(
+                    "MM ORDER: %s %s %s ×%d @%dc",
+                    action, side, ticker, base_size, price_cents,
+                )
+            except KalshiAPIError as exc:
+                results.append({
+                    "ticker": ticker, "action": label, "status": "error",
+                    "reason": str(exc)[:200],
+                })
+                logger.error("MM ORDER FAILED: %s %s %s — %s", action, side, ticker, exc)
+
+        return results
+
     # ── Batch Signal Processing ───────────────────────────────────────
 
     def process_scan_signals(
@@ -324,8 +435,10 @@ class OrderExecutor:
         """
         Process all signals from a market scan.
 
-        First refreshes state, then processes each signal with an
-        actionable edge, and finally cleans up stale orders.
+        In **market-making** mode, places two-sided quotes on every
+        ticker regardless of edge direction.
+
+        In **directional** mode, only acts on signals with |edge| > threshold.
         """
         self.refresh_state()
 
@@ -337,28 +450,44 @@ class OrderExecutor:
             if not ticker:
                 continue
 
-            signal = row.get("signal", "HOLD")
-            edge = row.get("edge", 0)
             fair_value = row.get("fair_value", 0)
+            edge = row.get("edge", 0)
             market_price = row.get("market_price", 0)
+            signal = row.get("signal", "HOLD")
 
-            if signal == "HOLD":
-                active_tickers.add(ticker)
-                continue
-
-            result = self.process_signal(
-                ticker=ticker,
-                fair_value=fair_value,
-                market_price=market_price,
-                edge=edge,
-                edge_threshold=edge_threshold,
-            )
-            results.append(result)
             active_tickers.add(ticker)
 
-        # Cancel orders on tickers whose signal flipped to HOLD
-        self._cleanup_stale_orders(active_tickers, scan_rows)
+            if self.market_making:
+                # Use per-ticker dynamic spread if the hybrid model provided one
+                dynamic_hs = row.get("dynamic_spread_cents")
+                if dynamic_hs is not None:
+                    saved = self.mm_half_spread_cents
+                    self.mm_half_spread_cents = int(dynamic_hs)
+                    mm_results = self.process_market_making_signal(ticker, fair_value)
+                    self.mm_half_spread_cents = saved
+                else:
+                    mm_results = self.process_market_making_signal(ticker, fair_value)
+                results.extend(mm_results)
 
+                # Also place directional order if edge is large
+                if abs(edge) >= edge_threshold:
+                    result = self.process_signal(
+                        ticker=ticker, fair_value=fair_value,
+                        market_price=market_price, edge=edge,
+                        edge_threshold=edge_threshold,
+                    )
+                    results.append(result)
+            else:
+                if signal == "HOLD":
+                    continue
+                result = self.process_signal(
+                    ticker=ticker, fair_value=fair_value,
+                    market_price=market_price, edge=edge,
+                    edge_threshold=edge_threshold,
+                )
+                results.append(result)
+
+        self._cleanup_stale_orders(active_tickers, scan_rows)
         return results
 
     def _cleanup_stale_orders(

@@ -19,7 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -303,7 +303,8 @@ class KalshiClient:
     STREAMING_KEYWORDS = [
         "spotify", "listener", "stream", "top artist",
         "monthly listener", "most listened", "top song",
-        "top album",
+        "top album", "subscriber", "kxtopartist",
+        "kxspotifysubs", "kxtopmonthly",
     ]
 
     def get_events(
@@ -312,6 +313,7 @@ class KalshiClient:
         limit: int = 200,
         cursor: str | None = None,
         with_nested_markets: bool = False,
+        series_ticker: str | None = None,
     ) -> tuple[list[Dict[str, Any]], str | None]:
         """Fetch events (groups of related markets)."""
         params: Dict[str, Any] = {"status": status, "limit": limit}
@@ -319,6 +321,8 @@ class KalshiClient:
             params["cursor"] = cursor
         if with_nested_markets:
             params["with_nested_markets"] = "true"
+        if series_ticker:
+            params["series_ticker"] = series_ticker
 
         data = self._request("GET", "/events", params=params)
         events = data.get("events", [])
@@ -329,14 +333,16 @@ class KalshiClient:
         self,
         status: str = "open",
         max_pages: int = 25,
+        series_ticker: str | None = None,
     ) -> list[Dict[str, Any]]:
-        """Paginate through all open events."""
+        """Paginate through all events, optionally filtered by series."""
         all_events: list[Dict[str, Any]] = []
         cursor: str | None = None
 
         for page in range(max_pages):
             batch, cursor = self.get_events(
                 status=status, limit=200, cursor=cursor,
+                series_ticker=series_ticker,
             )
             all_events.extend(batch)
             if not cursor or not batch:
@@ -548,6 +554,97 @@ class KalshiClient:
         }
 
         return enriched, rejected
+
+    def find_all_streaming_markets(
+        self,
+    ) -> List[Dict[str, Any]]:
+        """
+        Discover ALL active streaming-related markets across every series
+        (KXTOPMONTHLY, KXTOPARTIST, KXSPOTIFYSUBS, etc.).
+
+        Returns a list of enriched market dicts, each with:
+            series, event_ticker, event_title, market_type,
+            target_contract, competitors
+        """
+        logger.info("Discovering all active streaming markets...")
+        all_events = self.get_all_events(status="open")
+
+        streaming_events: list[Dict[str, Any]] = []
+        for e in all_events:
+            title = e.get("title", "").lower()
+            ticker = e.get("event_ticker", "").lower()
+            blob = f"{title} {ticker}"
+            if any(kw in blob for kw in self.STREAMING_KEYWORDS):
+                streaming_events.append(e)
+
+        logger.info(
+            "Found %d streaming events out of %d total",
+            len(streaming_events), len(all_events),
+        )
+
+        discovered: list[Dict[str, Any]] = []
+
+        for e in streaming_events:
+            event_ticker = e.get("event_ticker", "")
+            event_title = e.get("title", "")
+
+            # Classify series from event ticker
+            etk_upper = event_ticker.upper()
+            if "KXTOPMONTHLY" in etk_upper:
+                series = "KXTOPMONTHLY"
+            elif "KXTOPARTIST" in etk_upper:
+                series = "KXTOPARTIST"
+            elif "KXSPOTIFYSUBS" in etk_upper:
+                series = "KXSPOTIFYSUBS"
+            elif "KXSPOTIFYD" in etk_upper:
+                series = "KXSPOTIFYD"
+            elif "KXSPOTIFYW" in etk_upper:
+                series = "KXSPOTIFYW"
+            else:
+                series = "OTHER"
+
+            try:
+                full_event = self.get_event(event_ticker)
+            except Exception:
+                continue
+
+            markets = full_event.get("markets", [])
+            if not markets:
+                continue
+
+            # Extract all artist contracts from this event
+            contracts = []
+            for m in markets:
+                artist = (
+                    m.get("yes_sub_title", "")
+                    or m.get("custom_strike", {}).get("Artist", "")
+                )
+                contracts.append({
+                    "name": artist or m.get("ticker", ""),
+                    "ticker": m.get("ticker", ""),
+                    "yes_bid": m.get("yes_bid", 0) or 0,
+                    "yes_ask": m.get("yes_ask", 0) or 0,
+                    "last_price": m.get("last_price", 0) or 0,
+                    "volume": m.get("volume", 0) or 0,
+                })
+
+            market_type = "winner_take_all" if len(contracts) > 1 else "binary"
+
+            discovered.append({
+                "series": series,
+                "event_ticker": event_ticker,
+                "event_title": event_title,
+                "market_type": market_type,
+                "contracts": contracts,
+            })
+
+            logger.info(
+                "  %s — %s (%d contracts, %s)",
+                series, event_title, len(contracts), market_type,
+            )
+
+        logger.info("Total discovered: %d streaming events", len(discovered))
+        return discovered
 
     # ── Historical Data ─────────────────────────────────────────────────
 
