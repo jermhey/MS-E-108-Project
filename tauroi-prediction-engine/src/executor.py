@@ -299,7 +299,7 @@ class OrderExecutor:
                 post_only=True,
             )
 
-            self.store.track_order(order)
+            self.store.track_order(order, ticker_override=ticker)
 
             result["action"] = f"{action}_{side}"
             result["status"] = "placed"
@@ -406,7 +406,11 @@ class OrderExecutor:
                     ticker=ticker, side=side, action=action,
                     count=base_size, price_cents=price_cents, post_only=True,
                 )
-                self.store.track_order(order)
+                self.store.track_order(
+                    order,
+                    ticker_override=ticker,
+                    price_cents_override=price_cents,
+                )
                 results.append({
                     "ticker": ticker, "action": label, "status": "placed",
                     "reason": f"order {order.get('order_id', '?')}",

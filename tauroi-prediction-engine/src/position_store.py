@@ -164,15 +164,36 @@ class PositionStore:
         """Resting orders keyed by order_id."""
         return dict(self._orders)
 
-    def track_order(self, order: Dict[str, Any]) -> None:
-        """Start tracking a newly placed order."""
+    def track_order(
+        self,
+        order: Dict[str, Any],
+        *,
+        ticker_override: str | None = None,
+        price_cents_override: int | None = None,
+    ) -> None:
+        """
+        Start tracking a newly placed order.
+
+        Use ticker_override so we always have the correct ticker for lookups
+        even if the API response omits or uses a different field name.
+        """
         oid = order.get("order_id", "")
+        ticker = (
+            ticker_override
+            if ticker_override
+            else order.get("ticker") or order.get("contract_ticker") or ""
+        )
+        price_cents = (
+            price_cents_override
+            if price_cents_override is not None
+            else order.get("yes_price", 0)
+        )
         self._orders[oid] = {
             "order_id": oid,
-            "ticker": order.get("ticker", ""),
+            "ticker": ticker,
             "side": order.get("side", ""),
             "action": order.get("action", ""),
-            "price_cents": order.get("yes_price", 0),
+            "price_cents": price_cents,
             "count": order.get("remaining_count", order.get("initial_count", 0)),
             "status": order.get("status", "resting"),
             "placed_at": datetime.datetime.now(
@@ -184,10 +205,10 @@ class PositionStore:
         self.append_log({
             "event": "order_placed",
             "order_id": oid,
-            "ticker": order.get("ticker"),
+            "ticker": ticker,
             "side": order.get("side"),
             "action": order.get("action"),
-            "price_cents": order.get("yes_price"),
+            "price_cents": price_cents,
             "count": order.get("initial_count"),
         })
 
@@ -271,8 +292,30 @@ class PositionStore:
                     ticker, local["count"], pos_count,
                 )
 
-        # -- Reconcile orders --
-        api_order_ids = {o.get("order_id") for o in api_orders}
+        # -- Reconcile orders: remove local orders gone from API, and merge
+        # API orders into local store so ticker/side/price are correct for lookups
+        api_order_ids = set()
+        for o in api_orders:
+            oid = o.get("order_id")
+            if not oid:
+                continue
+            api_order_ids.add(oid)
+            ticker = o.get("ticker") or o.get("contract_ticker") or o.get("market_ticker") or ""
+            yes_price = o.get("yes_price", 0)
+            if isinstance(yes_price, float):
+                yes_price = int(round(yes_price * 100)) if yes_price <= 1 else int(yes_price)
+            self._orders[oid] = {
+                "order_id": oid,
+                "ticker": ticker,
+                "side": o.get("side", ""),
+                "action": o.get("action", ""),
+                "price_cents": yes_price,
+                "count": o.get("remaining_count", o.get("initial_count", 0)),
+                "status": o.get("status", "resting"),
+                "placed_at": self._orders.get(oid, {}).get("placed_at", ""),
+            }
+        self._save_orders()
+
         for oid in list(self._orders.keys()):
             if oid not in api_order_ids:
                 self.remove_order(oid, reason="reconciled_gone")
