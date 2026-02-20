@@ -293,23 +293,40 @@ class PositionStore:
                 )
 
         # -- Reconcile orders: remove local orders gone from API, and merge
-        # API orders into local store so ticker/side/price are correct for lookups
+        # API orders into local store so ticker/side/price are correct for lookups.
+        # Store price_cents in our convention: YES price for yes orders, NO price
+        # (100 - yes_price) for no orders, so drift check matches.
         api_order_ids = set()
         for o in api_orders:
             oid = o.get("order_id")
             if not oid:
                 continue
             api_order_ids.add(oid)
-            ticker = o.get("ticker") or o.get("contract_ticker") or o.get("market_ticker") or ""
+            ticker = (
+                o.get("ticker")
+                or o.get("contract_ticker")
+                or o.get("market_ticker")
+                or (o.get("market") or {}).get("ticker")
+            )
+            # Keep our stored ticker if API omits it (we set it when placing)
+            if not ticker and oid in self._orders:
+                ticker = self._orders[oid].get("ticker") or ""
+            ticker = ticker or ""
             yes_price = o.get("yes_price", 0)
             if isinstance(yes_price, float):
                 yes_price = int(round(yes_price * 100)) if yes_price <= 1 else int(yes_price)
+            side = (o.get("side") or "").lower()
+            # Our drift check uses the price we quote: YES cents for yes, NO cents for no
+            if side == "no":
+                price_cents = 100 - yes_price
+            else:
+                price_cents = yes_price
             self._orders[oid] = {
                 "order_id": oid,
                 "ticker": ticker,
-                "side": o.get("side", ""),
+                "side": side,
                 "action": o.get("action", ""),
-                "price_cents": yes_price,
+                "price_cents": price_cents,
                 "count": o.get("remaining_count", o.get("initial_count", 0)),
                 "status": o.get("status", "resting"),
                 "placed_at": self._orders.get(oid, {}).get("placed_at", ""),
