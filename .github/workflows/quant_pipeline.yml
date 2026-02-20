@@ -38,7 +38,7 @@ on:
   push:
     branches: ["main"]
   schedule:
-    - cron: "0 */6 * * *"          # every 6 hours (restarts the loop)
+    - cron: "0 */5 * * *"          # every 5 hours (overlaps kill previous via concurrency)
   workflow_dispatch:                # manual runs from the Actions tab
 
 # Prevent concurrent runs from overlapping
