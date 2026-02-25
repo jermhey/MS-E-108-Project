@@ -21,6 +21,11 @@ from typing import Any, Dict, List, Optional
 from src.kalshi_client import KalshiClient, KalshiAPIError
 from src.risk_manager import RiskManager, TradeProposal, RiskDecision
 from src.position_store import PositionStore
+from src.adverse_selection import (
+    detect_from_price_action,
+    AdverseSignal,
+    WIDEN_MULTIPLIER,
+)
 from src.utils import get_logger
 
 logger = get_logger("tauroi.executor")
@@ -30,8 +35,16 @@ logger = get_logger("tauroi.executor")
 STALE_ORDER_DRIFT_CENTS = 3
 
 # Default half-spread for market-making mode (cents).
-# Backtest shows net profitability at ≥8c after 1.5c/fill maker fee.
-DEFAULT_MM_HALF_SPREAD_CENTS = 8
+# Kalshi maker fee is 0.0175*P*(1-P) ≈ 0.05c–0.44c, so we can quote
+# tight.  3c half-spread = 6c full spread, net ~5.5c after fees.
+DEFAULT_MM_HALF_SPREAD_CENTS = 3
+
+# Inventory skew: shift quotes by this many cents per contract of
+# inventory to lean against the position and avoid toxic buildup.
+INVENTORY_SKEW_CENTS_PER_LOT = 1
+
+# Maximum inventory (contracts) before we pull quotes on one side.
+INVENTORY_PULL_THRESHOLD = 15
 
 
 class OrderExecutor:
@@ -55,7 +68,7 @@ class OrderExecutor:
         If True, place two-sided quotes around fair value instead of
         directional orders (default False).
     mm_half_spread_cents : int
-        Half-spread for market-making mode (default 8c).
+        Half-spread for market-making mode (default 3c).
     """
 
     def __init__(
@@ -126,6 +139,18 @@ class OrderExecutor:
             self._positions = self.kalshi.get_all_positions()
         except KalshiAPIError as exc:
             logger.warning("Failed to refresh state: %s", exc)
+
+    # ── Inventory Helpers ──────────────────────────────────────────────
+
+    def _signed_position(self, ticker: str) -> int:
+        """
+        Signed contract count for *ticker*.  Positive = long YES,
+        negative = long NO (short YES).
+        """
+        for p in self._positions:
+            if p.get("ticker") == ticker:
+                return p.get("position", 0)
+        return 0
 
     # ── Position Sizing ───────────────────────────────────────────────
 
@@ -340,11 +365,14 @@ class OrderExecutor:
         fair_value: float,
     ) -> List[Dict[str, Any]]:
         """
-        Place two-sided quotes around the model fair value.
+        Place two-sided quotes around the model fair value with
+        inventory-aware skew.
 
-        Posts a resting BUY-YES at ``fair - half_spread`` and a
-        resting BUY-NO (sell YES) at ``fair + half_spread``, both
-        with ``post_only=True`` for maker fees.
+        Skew shifts both quotes so we lean against our current position:
+        long YES -> lower quotes (more eager to sell, less to buy).
+
+        When inventory exceeds ``INVENTORY_PULL_THRESHOLD``, the side
+        that would *increase* inventory is pulled entirely.
 
         Returns a list of result dicts (one per side attempted).
         """
@@ -352,8 +380,12 @@ class OrderExecutor:
         hs = self.mm_half_spread_cents
         fair_cents = int(round(fair_value * 100))
 
-        bid_cents = max(1, fair_cents - hs)
-        ask_cents = min(99, fair_cents + hs)
+        # Inventory skew: positive = long YES, negative = long NO
+        inv = self._signed_position(ticker)
+        skew = int(inv * INVENTORY_SKEW_CENTS_PER_LOT)
+
+        bid_cents = max(1, fair_cents - hs - skew)
+        ask_cents = min(99, fair_cents + hs - skew)
 
         if bid_cents >= ask_cents:
             results.append({
@@ -362,15 +394,36 @@ class OrderExecutor:
             })
             return results
 
+        # Pull one side entirely if inventory is too large
+        pull_bid = inv >= INVENTORY_PULL_THRESHOLD
+        pull_ask = inv <= -INVENTORY_PULL_THRESHOLD
+
         base_size = max(1, int(
             (self._balance_cents / 100) * self.base_unit_pct / (fair_cents / 100)
         )) if self._balance_cents > 0 and fair_cents > 0 else 1
 
-        for side, action, price_cents, label in [
-            ("yes", "buy", bid_cents, "mm_bid"),
-            ("no", "buy", 100 - ask_cents, "mm_ask"),
+        for side, action, price_cents, label, pulled in [
+            ("yes", "buy", bid_cents, "mm_bid", pull_bid),
+            ("no", "buy", 100 - ask_cents, "mm_ask", pull_ask),
         ]:
             existing = self.store.get_resting_order_for_ticker(ticker, side)
+
+            # If this side is pulled due to inventory, cancel any
+            # existing order and skip placing a new one.
+            if pulled:
+                if existing:
+                    oid = existing.get("order_id", "")
+                    try:
+                        self.kalshi.cancel_order(oid)
+                        self.store.remove_order(oid, reason="inventory_pull")
+                    except KalshiAPIError as exc:
+                        logger.warning("Pull cancel failed %s: %s", oid, exc)
+                results.append({
+                    "ticker": ticker, "action": label, "status": "skipped",
+                    "reason": f"pulled — inventory {inv} exceeds threshold",
+                })
+                continue
+
             if existing:
                 drift = abs(price_cents - existing.get("price_cents", 0))
                 if drift <= STALE_ORDER_DRIFT_CENTS:
@@ -435,16 +488,21 @@ class OrderExecutor:
         self,
         scan_rows: List[Dict[str, Any]],
         edge_threshold: float = 0.05,
+        hf_data: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Process all signals from a market scan.
 
         In **market-making** mode, places two-sided quotes on every
-        ticker regardless of edge direction.
+        ticker regardless of edge direction.  Before quoting, each
+        ticker is checked for adverse-selection signals; if a 2.5σ
+        move is detected we pull all quotes instead.
 
         In **directional** mode, only acts on signals with |edge| > threshold.
         """
         self.refresh_state()
+        if hf_data is None:
+            hf_data = {}
 
         results: List[Dict[str, Any]] = []
         active_tickers: set[str] = set()
@@ -461,19 +519,40 @@ class OrderExecutor:
 
             active_tickers.add(ticker)
 
+            # Adverse-selection check (reactive, from price action)
+            hf_df = hf_data.get(ticker)
+            sigma_b = row.get("belief_sigma_b", 0)
+            adv = detect_from_price_action(hf_df, sigma_b, ticker=ticker)
+            if adv.triggered and adv.action == "pull":
+                logger.warning(
+                    "ADVERSE SELECTION — %s: %s — pulling all quotes",
+                    ticker, adv.detail,
+                )
+                self._cancel_all_for_ticker(ticker)
+                results.append({
+                    "ticker": ticker, "action": "adverse_pull",
+                    "status": "skipped",
+                    "reason": f"adverse selection: {adv.detail}",
+                })
+                continue
+
             if self.market_making:
-                # Use per-ticker dynamic spread if the hybrid model provided one
+                # Widen spread if near adverse threshold
                 dynamic_hs = row.get("dynamic_spread_cents")
-                if dynamic_hs is not None:
-                    saved = self.mm_half_spread_cents
-                    self.mm_half_spread_cents = int(dynamic_hs)
-                    mm_results = self.process_market_making_signal(ticker, fair_value)
-                    self.mm_half_spread_cents = saved
-                else:
-                    mm_results = self.process_market_making_signal(ticker, fair_value)
+                effective_hs = int(dynamic_hs) if dynamic_hs is not None else self.mm_half_spread_cents
+                if adv.triggered and adv.action == "widen":
+                    effective_hs = int(effective_hs * WIDEN_MULTIPLIER)
+                    logger.info(
+                        "WIDEN spread for %s: %s — hs=%dc",
+                        ticker, adv.detail, effective_hs,
+                    )
+
+                saved = self.mm_half_spread_cents
+                self.mm_half_spread_cents = effective_hs
+                mm_results = self.process_market_making_signal(ticker, fair_value)
+                self.mm_half_spread_cents = saved
                 results.extend(mm_results)
 
-                # Also place directional order if edge is large
                 if abs(edge) >= edge_threshold:
                     result = self.process_signal(
                         ticker=ticker, fair_value=fair_value,
@@ -493,6 +572,18 @@ class OrderExecutor:
 
         self._cleanup_stale_orders(active_tickers, scan_rows)
         return results
+
+    def _cancel_all_for_ticker(self, ticker: str) -> None:
+        """Cancel every resting order for *ticker* (adverse-selection pull)."""
+        for side in ("yes", "no"):
+            existing = self.store.get_resting_order_for_ticker(ticker, side)
+            if existing:
+                oid = existing.get("order_id", "")
+                try:
+                    self.kalshi.cancel_order(oid)
+                    self.store.remove_order(oid, reason="adverse_pull")
+                except KalshiAPIError as exc:
+                    logger.warning("Adverse pull cancel failed %s: %s", oid, exc)
 
     def _cleanup_stale_orders(
         self,

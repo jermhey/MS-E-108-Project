@@ -20,7 +20,7 @@
 #    - Max 50 contracts per ticker
 #    - $10 minimum balance floor
 #    - All orders placed with post_only=True (maker fees only)
-#    - 8c default half-spread (net profitable after 1.5c/fill fee)
+#    - 3c default half-spread (maker fee ~0.2c is negligible)
 #
 #  Triggers:
 #    - Cron: every 6 hours (restarts the long-running loop)
@@ -134,10 +134,10 @@ jobs:
             python main.py --belief --scan --dry-run
           else
             echo "LIVE MARKET-MAKING: belief scan every 60s (max 330 min)"
-            echo "Half-spread: 8c | Max order: 25 | Max daily loss: 10%"
+            echo "Half-spread: 3c | Max order: 10 | Max daily loss: 10%"
             timeout 19800 python main.py \
               --belief --scan --live --market-making \
-              --mm-spread 8 \
+              --mm-spread 3 \
               --max-order-size 10 \
               --max-daily-loss 0.10 \
               --loop --interval 60 \

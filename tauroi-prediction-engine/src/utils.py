@@ -57,6 +57,30 @@ def normalise_velocity(raw_posts: int, max_posts: int = 100_000) -> float:
     return min(raw_posts / max_posts, 1.0)
 
 
+def kalshi_maker_fee(count: int, price: float) -> float:
+    """
+    Kalshi maker fee per the official schedule.
+
+    Formula: 0.0175 * count * P * (1 - P)
+
+    Returns fee in **dollars** (not cents).
+    """
+    p = max(0.01, min(0.99, price))
+    return 0.0175 * count * p * (1.0 - p)
+
+
+def kalshi_taker_fee(count: int, price: float) -> float:
+    """
+    Kalshi taker fee per the official schedule.
+
+    Formula: 0.07 * count * P * (1 - P)
+
+    Returns fee in **dollars** (not cents).
+    """
+    p = max(0.01, min(0.99, price))
+    return 0.07 * count * p * (1.0 - p)
+
+
 def format_signal(edge: float, threshold: float = 0.05) -> str:
     """
     Convert a numerical edge into a human-readable trading signal.

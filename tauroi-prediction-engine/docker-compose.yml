@@ -3,10 +3,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  Usage:
 #    docker compose up              # single scan run
-#    docker compose up tauroi-loop  # continuous hourly loop
+#    docker compose up tauroi-loop  # continuous market-making loop
 #
 #  Secrets are read from .env (never baked into the image).
-#  The cache/ volume persists Chartmetric data between runs to avoid rate limits.
+#  The cache/ volume persists Kalshi HF data between runs.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -15,15 +15,15 @@ services:
     build: .
     env_file: .env
     volumes:
-      - ./signals:/app/signals      # persist signal logs to host
-      - ./cache:/app/cache          # persist Chartmetric data cache
+      - ./signals:/app/signals
+      - ./cache:/app/cache
 
   # Continuous loop (for a dedicated server / VM)
   tauroi-loop:
     build: .
     env_file: .env
-    command: ["python", "main.py", "--scan", "--loop", "--interval", "3600"]
+    command: ["python", "main.py", "--belief", "--scan", "--live", "--market-making", "--loop", "--interval", "60"]
     restart: unless-stopped
     volumes:
-      - ./signals:/app/signals      # persist signal logs to host
-      - ./cache:/app/cache          # persist Chartmetric data cache
+      - ./signals:/app/signals
+      - ./cache:/app/cache

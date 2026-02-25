@@ -1033,7 +1033,7 @@ def run(
     max_order_size: int = 25,
     max_daily_loss: float = 0.10,
     market_making: bool = False,
-    mm_half_spread_cents: int = 8,
+    mm_half_spread_cents: int = 3,
     hybrid: bool = False,
     belief: bool = False,
 ) -> None:
@@ -1260,7 +1260,7 @@ def _run_scan_pipeline(
     max_order_size: int = 25,
     max_daily_loss: float = 0.10,
     market_making: bool = False,
-    mm_half_spread_cents: int = 8,
+    mm_half_spread_cents: int = 3,
     hybrid: bool = False,
     belief: bool = False,
 ) -> list[Dict[str, Any]]:
@@ -1381,45 +1381,6 @@ def _run_scan_pipeline(
         except Exception as exc:
             logger.error("Pure belief pipeline failed, falling back: %s", exc)
 
-    # ── Hybrid belief overlay (deprecated — use --belief) ──────
-    elif hybrid and scan_results:
-        try:
-            from src.belief_data import fetch_hf_data
-            from src.belief_model import calibrate_belief
-            from src.hybrid_signal import generate_hybrid_signals
-            from src.kalshi_client import KalshiClient as _KalshiClient
-
-            kalshi_hf = _KalshiClient(settings=settings) if settings else None
-            if kalshi_hf is None:
-                kalshi_hf = _KalshiClient(settings=load_settings(require_secrets=True))
-
-            tickers_in_scan = [
-                r["ticker"] for r in scan_results if r.get("ticker")
-            ]
-            hf_data = {}
-            belief_cals = {}
-            for tkr in tickers_in_scan:
-                try:
-                    hf_df = fetch_hf_data(kalshi_hf, tkr, prefer_trades=True)
-                    if not hf_df.empty:
-                        hf_data[tkr] = hf_df
-                        belief_cals[tkr] = calibrate_belief(hf_df, ticker=tkr)
-                except Exception as exc:
-                    logger.warning("Belief model skip %s: %s", tkr, exc)
-
-            if belief_cals:
-                scan_results = generate_hybrid_signals(
-                    scan_results, belief_cals, hf_data,
-                )
-                logger.info(
-                    "Hybrid overlay applied — %d/%d tickers with belief model",
-                    len(belief_cals), len(tickers_in_scan),
-                )
-            else:
-                logger.warning("No belief calibrations — using fundamental-only signals")
-        except Exception as exc:
-            logger.error("Hybrid overlay failed, falling back: %s", exc)
-
     # ── Live execution ─────────────────────────────────────────────
     if live and scan_results:
         _execute_scan_signals(
@@ -1439,7 +1400,7 @@ def _execute_scan_signals(
     max_order_size: int,
     max_daily_loss: float,
     market_making: bool = False,
-    mm_half_spread_cents: int = 8,
+    mm_half_spread_cents: int = 3,
 ) -> None:
     """Send scan signals through the live execution pipeline."""
     from src.kalshi_client import KalshiClient
@@ -1541,36 +1502,20 @@ def _run_single_artist_pipeline(
 #  Standalone Belief-Only Pipeline (Chartmetric-free)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _run_belief_only(
-    dry_run: bool = True,
-    live: bool = False,
-    max_order_size: int = 25,
-    max_daily_loss: float = 0.10,
-    market_making: bool = False,
-    mm_half_spread_cents: int = 8,
-) -> None:
+def _generate_belief_signals(
+    kalshi: Any,
+) -> tuple[list[Dict[str, Any]], Dict[str, "pd.DataFrame"]]:
     """
-    Pure belief-model pipeline — uses **only Kalshi data**.
+    Pure belief-model signal generation — stateless, uses **only Kalshi data**.
 
-    Flow
-    ----
-    1. Load Kalshi credentials (no Chartmetric token needed).
-    2. Discover KXTOPMONTHLY contracts directly from Kalshi.
-    3. Fetch tick-level trades for each contract (with Parquet cache).
-    4. Calibrate logit jump-diffusion model per ticker.
-    5. Generate pure-belief signals (Kalman fair value + mean-rev).
-    6. Execute (live) or log (dry-run).
+    Discovers contracts, fetches HF trades, calibrates the logit
+    jump-diffusion model, and returns (scan_rows, hf_data).
     """
     import warnings
-    from src.kalshi_client import KalshiClient
     from src.belief_data import discover_tickers, fetch_hf_data, MIN_TRADES_FOR_SIGNAL
     from src.belief_model import calibrate_belief
     from src.hybrid_signal import generate_pure_belief_signals
 
-    settings = load_settings(require_secrets=True)
-    kalshi = KalshiClient(settings=settings)
-
-    # ── Step 1: Discover tickers directly from Kalshi ─────────────
     logger.info("=" * 64)
     logger.info("BELIEF-ONLY PIPELINE — Kalshi data only (no Chartmetric)")
     logger.info("=" * 64)
@@ -1591,13 +1536,12 @@ def _run_belief_only(
             "signal": "NO_CONTRACTS",
             "model": "pure_belief",
         })
-        return
+        return [], {}
 
     for t in open_tickers:
         print(f"    {t['ticker']:40s}  {t['title']}")
     print()
 
-    # ── Step 2: Fetch HF trade data (incremental) ────────────────
     hf_data: Dict[str, pd.DataFrame] = {}
     for info in open_tickers:
         tkr = info["ticker"]
@@ -1618,7 +1562,6 @@ def _run_belief_only(
     print(f"  HF data: {len(hf_data)} tickers with >= {MIN_TRADES_FOR_SIGNAL} trades, "
           f"{sum(len(df) for df in hf_data.values()):,} total trades")
 
-    # ── Step 3: Calibrate belief model ───────────────────────────
     belief_cals: Dict[str, Any] = {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -1636,15 +1579,13 @@ def _run_belief_only(
             "signal": "NO_CALIBRATIONS",
             "model": "pure_belief",
         })
-        return
+        return [], {}
 
-    # ── Step 4: Generate signals ─────────────────────────────────
     scan_results = generate_pure_belief_signals(
         belief_cals, hf_data,
         market_tickers=list(hf_data.keys()),
     )
 
-    # ── Step 5: Display + log ────────────────────────────────────
     print()
     print("  " + "-" * 60)
     print(f"  {'Ticker':<40s} {'Fair':>6s} {'Mkt':>6s} {'Edge':>7s} {'Signal':>6s} {'Sprd':>4s}")
@@ -1660,7 +1601,6 @@ def _run_belief_only(
     print("  " + "-" * 60)
     print()
 
-    # Log signal
     append_signal_log({
         "signal": "BELIEF_SCAN",
         "model": "pure_belief",
@@ -1680,16 +1620,7 @@ def _run_belief_only(
         ],
     })
 
-    # ── Step 6: Execute or dry-run ───────────────────────────────
-    if live and scan_results:
-        _execute_scan_signals(
-            scan_results, settings, max_order_size, max_daily_loss,
-            market_making=market_making,
-            mm_half_spread_cents=mm_half_spread_cents,
-        )
-    elif dry_run:
-        logger.info("DRY-RUN belief scan complete — no orders placed.")
-        print("  DRY-RUN complete — no orders placed.\n")
+    return scan_results, hf_data
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1844,8 +1775,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mm-spread",
         type=int,
-        default=8,
-        help="Half-spread in cents for market-making mode (default: 8).",
+        default=3,
+        help="Half-spread in cents for market-making mode (default: 3).",
     )
 
     # ── Belief model modes ──────────────────────────────────────────
@@ -1925,16 +1856,62 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── Belief-only pipeline (no Chartmetric) ─────────────────────
     if args.belief and args.scan:
-        def _belief_run() -> None:
+        from src.kalshi_client import KalshiClient as _BeliefKalshi
+        from src.executor import OrderExecutor as _BeliefExecutor
+        from src.risk_manager import RiskManager as _BeliefRisk
+        from src.position_store import PositionStore as _BeliefStore
+
+        _b_settings = load_settings(require_secrets=True)
+        _b_kalshi = _BeliefKalshi(settings=_b_settings)
+
+        # Create executor ONCE — reused across every loop cycle so
+        # in-memory order state (ticker, price) never gets lost.
+        _b_executor: _BeliefExecutor | None = None
+        if live:
+            _b_store = _BeliefStore()
+            _b_risk = _BeliefRisk(
+                max_order_size=args.max_order_size,
+                max_daily_loss_pct=args.max_daily_loss,
+            )
+            _b_executor = _BeliefExecutor(
+                _b_kalshi, _b_risk, _b_store,
+                market_making=args.market_making,
+                mm_half_spread_cents=args.mm_spread,
+            )
+            startup_info = _b_executor.startup()
+            mode_label = "MARKET-MAKING" if args.market_making else "DIRECTIONAL"
+            print()
+            print("  " + "=" * 60)
+            print(f"  LIVE EXECUTION ENGINE — {mode_label}")
+            print("  " + "=" * 60)
+            print(f"  Balance:         ${startup_info['balance_dollars']:.2f}")
+            print(f"  Open positions:  {startup_info['open_positions']}")
+            print(f"  Resting orders:  {startup_info['resting_orders']}")
+            print(f"  Max order size:  {_b_risk.max_order_size} contracts")
+            print(f"  Max daily loss:  {_b_risk.max_daily_loss_pct:.0%}")
+            if args.market_making:
+                print(f"  MM half-spread:  {args.mm_spread}c")
+            print("  " + "-" * 60)
+
+        def _belief_cycle() -> None:
             try:
-                _run_belief_only(
-                    dry_run=not live,
-                    live=live,
-                    max_order_size=args.max_order_size,
-                    max_daily_loss=args.max_daily_loss,
-                    market_making=args.market_making,
-                    mm_half_spread_cents=args.mm_spread,
-                )
+                scan_results, hf_data = _generate_belief_signals(_b_kalshi)
+                if live and scan_results and _b_executor is not None:
+                    results = _b_executor.process_scan_signals(
+                        scan_results, edge_threshold=EDGE_THRESHOLD,
+                        hf_data=hf_data,
+                    )
+                    placed = [r for r in results if r["status"] == "placed"]
+                    rejected = [r for r in results if r["status"] == "rejected"]
+                    errors = [r for r in results if r["status"] == "error"]
+                    skipped = len(results) - len(placed) - len(rejected) - len(errors)
+                    print(f"  Placed: {len(placed)} | Skipped: {skipped} | "
+                          f"Rejected: {len(rejected)} | Errors: {len(errors)}")
+                    for r in placed:
+                        print(f"    + {r['action']} {r['ticker']} — {r['reason']}")
+                elif not live:
+                    logger.info("DRY-RUN belief scan complete — no orders placed.")
+                    print("  DRY-RUN complete — no orders placed.\n")
             except KeyboardInterrupt:
                 raise
             except Exception:
@@ -1953,11 +1930,11 @@ def main(argv: list[str] | None = None) -> None:
                 args.interval,
             )
             while True:
-                _belief_run()
+                _belief_cycle()
                 logger.info("Next belief run in %d seconds...", args.interval)
                 _time.sleep(args.interval)
         else:
-            _belief_run()
+            _belief_cycle()
         return
 
     # ── Standard pipeline (Chartmetric + fundamental model) ──────

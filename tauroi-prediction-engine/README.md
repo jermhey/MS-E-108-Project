@@ -1,6 +1,6 @@
 # Tauroi Prediction Engine
 
-**High-Frequency Nowcasting & Arbitrage Engine for Pop-Culture Prediction Markets**
+**Adverse-Selection Detection & Market-Making for Kalshi Prediction Markets**
 
 *Tauroi Technologies — MS&E 108 Project*
 
@@ -8,41 +8,31 @@
 
 ## Overview
 
-Prediction markets on platforms like **Kalshi** let traders bet on real-world outcomes — for example, *"Which artist will have the most Spotify monthly listeners at the end of February?"*
+This system detects **adverse selection events** in Kalshi prediction markets
+and uses those signals to protect a market-making strategy from toxic order flow.
 
-The settlement oracle (Spotify) publishes listener counts on a **24-hour lag** (a step function). During that window, the *true* underlying trajectory is invisible to market participants who rely solely on the official number.
-
-**Our edge: we don't wait.**
-
-We ingest high-frequency social-velocity data (TikTok sound-post volumes, release calendars) from the **Chartmetric API** and build a real-time **"nowcast"** of the settlement number *before* it publishes. We then compare our model's fair value against the **live Kalshi market price** and exploit the spread.
+The core methodology is grounded in
+[**"Toward Black-Scholes for Prediction Markets"** (Dalen, 2025)](https://arxiv.org/abs/2510.15205),
+which models prediction-market prices as a **logit jump-diffusion** process.
+We calibrate the model on Kalshi's **KXTOPMONTHLY** contracts (monthly Spotify
+listener counts) and extract real-time adverse-selection signals that a market
+maker can act on.
 
 ### Key Capabilities
 
-- **Jump-Diffusion pricing model** with conditional volatility and event-driven sigma boosts
-- **Full Chartmetric API integration** — 7 years of Spotify + TikTok history, paginated automatically
-- **Live Kalshi market discovery** — Two-stage event resolver with WTA competitor extraction
-- **Automatic competitor intelligence** — resolves all competitors via Chartmetric search, fetches their live listener counts, and uses the leader as the pricing strike
-- **Backtesting engine** with risk-adjusted sizing, stop-loss, and stress tests
-- **Signal persistence** — every run logs a structured JSON record for audit and analysis
-- **Cloud-ready** — Dockerfile, GitHub Actions CI/CD, loop mode for continuous monitoring
-
----
-
-## Why Jump-Diffusion over Black-Scholes?
-
-| Property | Black-Scholes (GBM) | Jump-Diffusion (Merton) |
-|---|---|---|
-| Path continuity | Continuous | Discontinuous jumps allowed |
-| Tail behavior | Thin (Gaussian) | **Fat tails** from jump component |
-| Viral event modeling | Under-prices tail risk | Captures sudden regime shifts |
-| Volatility regime | Single constant sigma | Conditional sigma (TikTok-driven) |
-
-A single viral TikTok trend can add **millions** of listeners in hours. Black-Scholes assigns near-zero probability to these moves. Our model detects the jump regime via TikTok velocity and continuously adjusts volatility:
-
-```
-sigma_adj = sigma_base + (gamma * tiktok_velocity)   # Conditional volatility
-sigma_final = sigma_adj * event_impact_score          # Event-driven boost
-```
+- **Logit jump-diffusion model** — prices modeled in log-odds space where
+  Gaussian assumptions hold, with explicit jump and diffusion components
+- **Heteroskedastic Kalman filter** — denoises log-odds series accounting for
+  irregular trade arrival times
+- **Rolling EM calibration** — extracts belief-volatility (σ_b), jump intensity
+  (λ), and jump variance (s_J²) with walk-forward estimation
+- **Composite adverse-selection score** — combines jump posterior probability
+  (γ_t) with trade-arrival burst detection for robust AS identification
+- **Market-making backtest** — compares naive vs. AS-informed quoting with
+  real Kalshi maker fees and mark-to-market PnL
+- **Live execution engine** — order lifecycle management with inventory skew,
+  stale-order replacement, and quote pulling on AS events
+- **Cloud-ready** — Dockerfile, GitHub Actions CI/CD
 
 ---
 
@@ -50,38 +40,47 @@ sigma_final = sigma_adj * event_impact_score          # Event-driven boost
 
 ```
 tauroi-prediction-engine/
-├── .github/workflows/
-│   └── quant_pipeline.yml      # CI/CD — tests + live signal every 15 min
 ├── src/
-│   ├── calibration.py          # Sigma, gamma, beta calibration from data
-│   ├── chartmetric_client.py   # Chartmetric API (full history + competitor search)
-│   ├── config.py               # Secure .env loader
-│   ├── data_loader.py          # Mock data for tests
-│   ├── kalshi_client.py        # Kalshi API (RSA-PSS auth + market discovery)
-│   ├── pricing_engine.py       # Jump-Diffusion pricer + implied vol solver
-│   └── utils.py                # Logging, normalisation, signal formatting
+│   ├── as_detector.py        # AS detection: Kalman filter, EM calibration, burst detection
+│   ├── mm_backtest.py        # Market-making backtest & fill-toxicity analysis
+│   ├── adverse_selection.py  # Reactive AS defense (z-score quote pulling)
+│   ├── belief_model.py       # Core belief model (Kalman + EM)
+│   ├── belief_data.py        # High-frequency Kalshi data fetcher with caching
+│   ├── belief_eval.py        # Walk-forward model evaluation
+│   ├── calibration.py        # Parameter calibration from data
+│   ├── pricing_engine.py     # Jump-diffusion pricer & Monte Carlo
+│   ├── executor.py           # Order execution engine (directional + MM modes)
+│   ├── kalshi_client.py      # Kalshi REST API client (RSA-PSS auth)
+│   ├── risk_manager.py       # Position limits, circuit breakers
+│   ├── position_store.py     # Persistent position tracking
+│   ├── config.py             # Settings loader (.env)
+│   └── utils.py              # Logging, fee calculations, helpers
+├── notebooks/
+│   ├── adverse_selection.ipynb   # Full AS analysis: calibration, detection, backtest
+│   └── alpha_proof.ipynb         # Belief-model evaluation & alpha attribution
+├── cache/
+│   └── kalshi_hf/            # Cached tick-level Kalshi trade data (Parquet)
 ├── tests/
-│   └── test_pricing.py         # Pricing engine unit tests
+│   └── __init__.py
 ├── signals/
-│   └── signal_log.jsonl        # Append-only signal audit trail
-├── main.py                     # Entry point (single run / loop / GitHub Action)
-├── run_backtest.py             # Historical backtester
-├── Dockerfile                  # Container image
-├── docker-compose.yml          # One-command deployment
-├── requirements.txt            # Python dependencies
-└── .env.example                # Required secrets template
+│   └── signal_log.jsonl      # Append-only signal audit trail
+├── main.py                   # Entry point (scan / live / market-making modes)
+├── Dockerfile
+├── requirements.txt
+├── STRATEGY.md               # Detailed market-making strategy documentation
+└── .env.example              # Required secrets template
 ```
 
 ---
 
 ## Quick Start
 
-### 1. Clone & configure secrets
+### 1. Clone & configure
 
 ```bash
 git clone <repo-url> && cd tauroi-prediction-engine
 cp .env.example .env
-# Edit .env with your API keys (see below)
+# Edit .env with your Kalshi API keys
 ```
 
 ### 2. Install dependencies
@@ -90,124 +89,74 @@ cp .env.example .env
 pip install -r requirements.txt
 ```
 
-### 3. Run
+### 3. Run the AS analysis notebook
 
 ```bash
-# Full live analysis (single run)
-python main.py
-
-# Data + calibration only (no Kalshi — faster, no API keys needed)
-python main.py --data-only
-
-# Continuous monitoring (re-runs every 15 minutes)
-python main.py --loop --interval 900
+jupyter notebook notebooks/adverse_selection.ipynb
 ```
+
+The notebook walks through the full pipeline:
+1. Loads cached tick data from `cache/kalshi_hf/`
+2. Calibrates the logit jump-diffusion model via rolling EM
+3. Detects adverse-selection events (jump posterior + burst clustering)
+4. Validates with fill-toxicity statistics
+5. Runs market-making backtest (naive MM vs. AS-informed MM)
+6. Sweeps AS-score thresholds to find optimal operating point
+
+### 4. Live trading (optional)
+
+```bash
+# Dry run — log signals without placing orders
+python main.py --belief --scan --dry-run
+
+# Live market-making
+python main.py --live --market-making
+```
+
+---
+
+## Adverse Selection Detection
+
+The detection pipeline combines two complementary signals into a composite
+**AS score** ∈ [0, 1]:
+
+| Signal | Method | What it captures |
+|--------|--------|------------------|
+| **Jump posterior (γ_t)** | EM-separated jump component from logit increments | Sudden information-driven price moves |
+| **Burst flag** | Two-timescale median inter-trade time comparison | Abnormal clustering of trade arrivals |
+
+**Composite score:** `AS = α · γ_t + (1 − α) · burst_ratio`  (default α = 0.7)
+
+When AS score exceeds the threshold (τ ≈ 0.7), the market maker pulls quotes
+to avoid adverse fills.
+
+### Validation
+
+On the 13 most liquid KXTOPMONTHLY contracts (~38k trades):
+
+- Subsequent price moves during AS-flagged periods are **1.2–1.6× larger**
+  than during unflagged periods (p < 0.0001)
+- AS-informed MM shows improved PnL vs. naive MM on the most liquid contracts
+  at τ = 0.7–0.8
 
 ---
 
 ## Required Secrets
 
-| Variable | Where to get it | Required for |
-|---|---|---|
-| `KALSHI_ACCESS_KEY` | [kalshi.com/account/api](https://kalshi.com/account/api) | Live market prices |
-| `KALSHI_API_SECRET` | Same (RSA private key, PEM format) | Live market prices |
-| `CHARTMETRIC_REFRESH_TOKEN` | [app.chartmetric.com](https://app.chartmetric.com) → Account → API | All data fetching |
-| `CHARTMETRIC_ARTIST_ID` | `app.chartmetric.com/artist?id=<THIS>` | Target artist (default: 214945 = Bad Bunny) |
+| Variable | Source | Required for |
+|----------|--------|--------------|
+| `KALSHI_ACCESS_KEY` | [kalshi.com/account/api](https://kalshi.com/account/api) | All Kalshi operations |
+| `KALSHI_API_SECRET` | Same (RSA private key, PEM) | All Kalshi operations |
 
-For **GitHub Actions**, add these as repository secrets:
-**Settings → Secrets and variables → Actions → New repository secret**
+Add these as GitHub repository secrets for CI/CD deployment.
 
 ---
 
-## Deployment
+## References
 
-### Option A: GitHub Actions (recommended)
-
-The repo ships with a production workflow that:
-1. Runs **unit tests** on every push
-2. Runs the **full live engine** every 15 minutes (cron)
-3. Persists the signal to `signals/signal_log.jsonl` (committed to repo)
-4. Uploads the signal log as a **build artifact** (90-day retention)
-
-**Setup:** Push to GitHub, add secrets, enable Actions. That's it.
-
-### Option B: Docker (any server)
-
-```bash
-# Build
-docker build -t tauroi .
-
-# Single run
-docker run --env-file .env -v $(pwd)/signals:/app/signals tauroi
-
-# Continuous loop (15-min interval, auto-restart)
-docker compose up tauroi-loop -d
-```
-
-### Option C: Any server with Python
-
-```bash
-pip install -r requirements.txt
-python main.py --loop --interval 900
-```
-
-Use `systemd`, `supervisord`, or `tmux` to keep it alive.
+- Dalen, S. (2025). *Toward Black-Scholes for Prediction Markets.*
+  arXiv:2510.15205. [[link]](https://arxiv.org/abs/2510.15205)
 
 ---
 
-## Signal Log
-
-Every run appends one JSON line to `signals/signal_log.jsonl`:
-
-```json
-{
-  "artist": "Bad Bunny",
-  "date": "2026-02-12",
-  "spot_official": 101419370,
-  "spot_nowcast": 117465088,
-  "strike": 133758600,
-  "leader": "Bruno Mars",
-  "market_type": "winner_take_all",
-  "fair_value": 0.2319,
-  "market_price": 0.19,
-  "edge": 0.0419,
-  "signal": "HOLD",
-  "sigma_adj": 0.9717,
-  "ticker": "KXTOPMONTHLY-26FEB-BAD",
-  "T_days": 15.9,
-  "logged_at": "2026-02-12T19:01:19Z"
-}
-```
-
-Load for analysis:
-
-```python
-import pandas as pd
-df = pd.read_json("signals/signal_log.jsonl", lines=True)
-```
-
----
-
-## CLI Reference
-
-```
-python main.py [OPTIONS]
-
-Options:
-  --dry-run                  Log signals without placing orders
-  --data-only                Fetch + calibrate only (skip Kalshi)
-  --strike FLOAT             Override strike price (default: 100M)
-  --competitor-listeners N   Manual override for leader's listeners
-  --loop                     Run continuously
-  --interval SECONDS         Seconds between loop iterations (default: 900)
-```
-
----
-
-## Team
-
-**Tauroi Technologies** — MS&E 108 Project
-
----
-
-*Disclaimer: This is an academic research project. No real capital is at risk. All market interactions are read-only.*
+*Tauroi Technologies — MS&E 108 Project*
