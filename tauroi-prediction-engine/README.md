@@ -1,6 +1,6 @@
 # Tauroi Prediction Engine
 
-**Adverse-Selection Detection & Market-Making for Kalshi Prediction Markets**
+**Adverse-Selection Detection for Kalshi Prediction Markets**
 
 *Tauroi Technologies — MS&E 108 Project*
 
@@ -9,14 +9,14 @@
 ## Overview
 
 This system detects **adverse selection events** in Kalshi prediction markets
-and uses those signals to protect a market-making strategy from toxic order flow.
+and produces a real-time composite score that can be plugged into any
+market-making infrastructure.
 
 The core methodology is grounded in
 [**"Toward Black-Scholes for Prediction Markets"** (Dalen, 2025)](https://arxiv.org/abs/2510.15205),
 which models prediction-market prices as a **logit jump-diffusion** process.
 We calibrate the model on Kalshi's **KXTOPMONTHLY** contracts (monthly Spotify
-listener counts) and extract real-time adverse-selection signals that a market
-maker can act on.
+listener counts) and extract adverse-selection signals per trade.
 
 ### Key Capabilities
 
@@ -30,9 +30,7 @@ maker can act on.
   (γ_t) with trade-arrival burst detection for robust AS identification
 - **Market-making backtest** — compares naive vs. AS-informed quoting with
   real Kalshi maker fees and mark-to-market PnL
-- **Live execution engine** — order lifecycle management with inventory skew,
-  stale-order replacement, and quote pulling on AS events
-- **Cloud-ready** — Dockerfile, GitHub Actions CI/CD
+- **Kalshi API client** — fetch live tick-level trade data for any contract
 
 ---
 
@@ -43,16 +41,9 @@ tauroi-prediction-engine/
 ├── src/
 │   ├── as_detector.py        # AS detection: Kalman filter, EM calibration, burst detection
 │   ├── mm_backtest.py        # Market-making backtest & fill-toxicity analysis
-│   ├── adverse_selection.py  # Reactive AS defense (z-score quote pulling)
 │   ├── belief_model.py       # Core belief model (Kalman + EM)
 │   ├── belief_data.py        # High-frequency Kalshi data fetcher with caching
-│   ├── belief_eval.py        # Walk-forward model evaluation
-│   ├── calibration.py        # Parameter calibration from data
-│   ├── pricing_engine.py     # Jump-diffusion pricer & Monte Carlo
-│   ├── executor.py           # Order execution engine (directional + MM modes)
 │   ├── kalshi_client.py      # Kalshi REST API client (RSA-PSS auth)
-│   ├── risk_manager.py       # Position limits, circuit breakers
-│   ├── position_store.py     # Persistent position tracking
 │   ├── config.py             # Settings loader (.env)
 │   └── utils.py              # Logging, fee calculations, helpers
 ├── notebooks/
@@ -61,13 +52,8 @@ tauroi-prediction-engine/
 ├── cache/
 │   └── kalshi_hf/            # Cached tick-level Kalshi trade data (Parquet)
 ├── tests/
-│   └── __init__.py
-├── signals/
-│   └── signal_log.jsonl      # Append-only signal audit trail
-├── main.py                   # Entry point (scan / live / market-making modes)
-├── Dockerfile
+│   └── test_as_detector.py   # Smoke tests for Kalman, burst detection, E2E
 ├── requirements.txt
-├── STRATEGY.md               # Detailed market-making strategy documentation
 └── .env.example              # Required secrets template
 ```
 
@@ -103,15 +89,26 @@ The notebook walks through the full pipeline:
 5. Runs market-making backtest (naive MM vs. AS-informed MM)
 6. Sweeps AS-score thresholds to find optimal operating point
 
-### 4. Live trading (optional)
+---
 
-```bash
-# Dry run — log signals without placing orders
-python main.py --belief --scan --dry-run
+## Integration
 
-# Live market-making
-python main.py --live --market-making
+The detector is designed to plug into external market-making infrastructure.
+Core usage:
+
+```python
+from src.as_detector import run_as_detection
+
+result = run_as_detection(df, ticker="KXTOPMONTHLY-26FEB-BAD")
+
+result.as_score      # float array [0, 1] — composite AS score per trade
+result.gamma         # float array — jump posterior probability
+result.burst_flags   # bool array — trade-arrival burst flags
+result.events        # DataFrame of flagged AS events
 ```
+
+The `as_score` can drive any response: spread widening, quote pulling,
+position skewing, or risk monitoring.
 
 ---
 
@@ -127,17 +124,13 @@ The detection pipeline combines two complementary signals into a composite
 
 **Composite score:** `AS = α · γ_t + (1 − α) · burst_ratio`  (default α = 0.7)
 
-When AS score exceeds the threshold (τ ≈ 0.7), the market maker pulls quotes
-to avoid adverse fills.
-
 ### Validation
 
-On the 13 most liquid KXTOPMONTHLY contracts (~38k trades):
+On the 13 most liquid KXTOPMONTHLY contracts (~33k trades):
 
-- Subsequent price moves during AS-flagged periods are **1.2–1.6× larger**
-  than during unflagged periods (p < 0.0001)
-- AS-informed MM shows improved PnL vs. naive MM on the most liquid contracts
-  at τ = 0.7–0.8
+- Subsequent price moves during AS-flagged periods are **1.5–2x larger**
+  than during unflagged periods (p < 0.0001 on liquid contracts)
+- Cross-ticker co-jump probability of 40–50% across correlated contracts
 
 ---
 
@@ -145,10 +138,8 @@ On the 13 most liquid KXTOPMONTHLY contracts (~38k trades):
 
 | Variable | Source | Required for |
 |----------|--------|--------------|
-| `KALSHI_ACCESS_KEY` | [kalshi.com/account/api](https://kalshi.com/account/api) | All Kalshi operations |
-| `KALSHI_API_SECRET` | Same (RSA private key, PEM) | All Kalshi operations |
-
-Add these as GitHub repository secrets for CI/CD deployment.
+| `KALSHI_ACCESS_KEY` | [kalshi.com/account/api](https://kalshi.com/account/api) | Fetching trade data |
+| `KALSHI_API_SECRET` | Same (RSA private key, PEM) | Fetching trade data |
 
 ---
 

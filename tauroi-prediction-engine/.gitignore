@@ -16,9 +16,3 @@ build/
 
 # ── generated figures (reproducible from notebooks) ─────────────────────────
 figures/
-
-# ── live trading state (positions, orders, P&L) ─────────────────────────────
-state/
-
-# ── signals (track the JSONL log, ignore temp files) ────────────────────────
-signals/*.tmp
