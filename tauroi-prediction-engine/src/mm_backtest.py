@@ -39,8 +39,8 @@ class Fill:
     timestamp: object
     side: str              # "buy" or "sell" (from MM's perspective)
     price: float           # fill price
-    spread_earned: float   # half-spread captured
-    mtm_1h: float          # mark-to-market P&L at horizon
+    spread_earned: float   # edge captured at execution vs pre-trade mid (cents)
+    mtm_horizon: float     # mark-to-market P&L from pre-trade mid to horizon (cents)
     fee: float             # maker fee paid
 
 
@@ -94,12 +94,31 @@ def _compute_half_spread(price: float, base_spread_cents: float = 2.0) -> float:
     return base_spread_cents / 100.0
 
 
+def _compute_future_indices_minutes(
+    timestamps: np.ndarray,
+    horizon_minutes: float,
+) -> np.ndarray:
+    """
+    For each trade i, return the first index j >= i whose timestamp is at
+    least `horizon_minutes` after trade i. If none exists, returns -1.
+    """
+    ts_ns = pd.to_datetime(timestamps).astype("int64")
+    horizon_ns = int(round(horizon_minutes * 60.0 * 1_000_000_000))
+    targets = ts_ns + horizon_ns
+    future_idx = np.searchsorted(ts_ns, targets, side="left")
+    future_idx[future_idx >= len(timestamps)] = -1
+    return future_idx
+
+
 def backtest_mm(
     as_result: ASResult,
     strategy: str = "naive",
     as_threshold: float = 0.5,
-    half_spread_cents: float = 2.0,
-    mtm_horizon_trades: int = 60,
+    half_spread_cents: float = 1.0,
+    mtm_horizon_trades: Optional[int] = 60,
+    mtm_horizon_minutes: Optional[float] = None,
+    decision_lag_trades: int = 1,
+    include_fees: bool = True,
     settlement_price: Optional[float] = None,
 ) -> MMResult:
     """
@@ -115,8 +134,19 @@ def backtest_mm(
         AS score threshold for pulling quotes (only used for "as_informed").
     half_spread_cents : float
         Half-spread in cents that the MM quotes.
-    mtm_horizon_trades : int
+    mtm_horizon_trades : int or None
         Number of trades into the future for mark-to-market evaluation.
+        Ignored if `mtm_horizon_minutes` is provided.
+    mtm_horizon_minutes : float or None
+        If provided, mark-to-market at the first trade at or after this many
+        minutes after the fill. This is the preferred cross-market setting
+        because it is comparable across thick and thin markets.
+    decision_lag_trades : int
+        Number of trades by which the AS signal is lagged before it can
+        affect quoting. Set to 1 to avoid same-trade lookahead bias.
+    include_fees : bool
+        If True, subtract Kalshi maker fees on each fill. Set to False for
+        institutional fee-free sensitivity runs.
     settlement_price : float or None
         If provided, use this as the terminal value for P&L calculation.
         For settled contracts, this is 0 or 1.
@@ -126,18 +156,30 @@ def backtest_mm(
     timestamps = as_result.timestamps
     n = len(prices)
 
+    if strategy not in {"naive", "as_informed"}:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    if decision_lag_trades < 0:
+        raise ValueError("decision_lag_trades must be >= 0")
+    if mtm_horizon_minutes is None and (mtm_horizon_trades is None or mtm_horizon_trades < 1):
+        raise ValueError("Provide mtm_horizon_minutes or mtm_horizon_trades >= 1")
+
     half_spread = half_spread_cents / 100.0
     fills: List[Fill] = []
     cumulative = np.zeros(n)
 
     running_pnl = 0.0
     n_pulled = 0
+    future_idx_minutes = None
+    if mtm_horizon_minutes is not None:
+        future_idx_minutes = _compute_future_indices_minutes(timestamps, mtm_horizon_minutes)
 
     for i in range(1, n):
         price_change = prices[i] - prices[i - 1]
 
-        # Determine if MM has quotes live
-        if strategy == "as_informed" and as_scores[i] > as_threshold:
+        # Determine if MM has quotes live. We intentionally lag the signal so
+        # the quoting decision uses only information available before trade i.
+        signal_idx = max(0, i - decision_lag_trades)
+        if strategy == "as_informed" and as_scores[signal_idx] > as_threshold:
             n_pulled += 1
             cumulative[i] = running_pnl
             continue
@@ -164,17 +206,28 @@ def backtest_mm(
 
         spread_earned = half_spread
 
-        # Mark-to-market: how does our fill look `mtm_horizon_trades` later?
-        future_idx = min(i + mtm_horizon_trades, n - 1)
-        future_price = prices[future_idx]
-
-        if mm_side == "sell":
-            mtm = fill_price - future_price  # sold high, value dropped = profit
+        if future_idx_minutes is not None:
+            future_idx = int(future_idx_minutes[i])
+            if future_idx < 0:
+                future_price = settlement_price if settlement_price is not None else prices[-1]
+            else:
+                future_price = prices[future_idx]
         else:
-            mtm = future_price - fill_price  # bought low, value rose = profit
+            future_idx = min(i + int(mtm_horizon_trades), n - 1)
+            future_price = prices[future_idx]
+
+        # Decompose PnL into:
+        #   (a) spread edge captured vs the pre-trade mid, and
+        #   (b) signed move in the reference mid over the holding horizon.
+        # This avoids double-counting the spread inside mark-to-market.
+        reference_mid = prices[i - 1]
+        if mm_side == "sell":
+            mtm = reference_mid - future_price
+        else:
+            mtm = future_price - reference_mid
 
         # Maker fee
-        fee = kalshi_maker_fee(1, fill_price) * 100  # convert to cents
+        fee = kalshi_maker_fee(1, fill_price) * 100 if include_fees else 0.0
 
         fill_pnl = (spread_earned + mtm) * 100 - fee  # all in cents
 
@@ -184,7 +237,7 @@ def backtest_mm(
             side=mm_side,
             price=fill_price,
             spread_earned=spread_earned * 100,
-            mtm_1h=mtm * 100,
+            mtm_horizon=mtm * 100,
             fee=fee,
         ))
 
@@ -209,10 +262,10 @@ def backtest_mm(
 
     gross_spread = sum(f.spread_earned for f in fills)
     total_fees = sum(f.fee for f in fills)
-    mtm_pnl = sum(f.mtm_1h for f in fills)
+    mtm_pnl = sum(f.mtm_horizon for f in fills)
     net_pnl = gross_spread + mtm_pnl - total_fees
 
-    fill_pnls = [(f.spread_earned + f.mtm_1h - f.fee) for f in fills]
+    fill_pnls = [(f.spread_earned + f.mtm_horizon - f.fee) for f in fills]
     win_rate = sum(1 for p in fill_pnls if p > 0) / n_fills
 
     return MMResult(
@@ -267,8 +320,11 @@ class ComparisonResult:
 def compare_strategies(
     as_result: ASResult,
     as_threshold: float = 0.7,
-    half_spread_cents: float = 2.0,
-    mtm_horizon_trades: int = 60,
+    half_spread_cents: float = 1.0,
+    mtm_horizon_trades: Optional[int] = 60,
+    mtm_horizon_minutes: Optional[float] = None,
+    decision_lag_trades: int = 1,
+    include_fees: bool = True,
     settlement_price: Optional[float] = None,
 ) -> ComparisonResult:
     """Run both strategies on the same ticker and compare."""
@@ -276,6 +332,9 @@ def compare_strategies(
         as_result, strategy="naive",
         half_spread_cents=half_spread_cents,
         mtm_horizon_trades=mtm_horizon_trades,
+        mtm_horizon_minutes=mtm_horizon_minutes,
+        decision_lag_trades=decision_lag_trades,
+        include_fees=include_fees,
         settlement_price=settlement_price,
     )
     informed = backtest_mm(
@@ -283,6 +342,9 @@ def compare_strategies(
         as_threshold=as_threshold,
         half_spread_cents=half_spread_cents,
         mtm_horizon_trades=mtm_horizon_trades,
+        mtm_horizon_minutes=mtm_horizon_minutes,
+        decision_lag_trades=decision_lag_trades,
+        include_fees=include_fees,
         settlement_price=settlement_price,
     )
 
@@ -318,6 +380,7 @@ def compare_all_tickers(
 def analyse_fill_toxicity(
     as_result: ASResult,
     mtm_horizons: Optional[List[int]] = None,
+    as_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """
     Compare average price continuation during AS-flagged vs non-flagged periods.
@@ -325,8 +388,12 @@ def analyse_fill_toxicity(
     This is the core validation: if flagged periods have significantly
     larger adverse price moves, the detector is identifying toxic flow.
 
-    Returns a DataFrame with one row per horizon showing mean absolute
-    price move for flagged and unflagged trades, plus a t-test.
+    Parameters
+    ----------
+    as_threshold : float
+        AS score above which a trade is considered "flagged". Default 0.5.
+        Use a lower value (e.g. 0.2) for diffusion-only models where AS score
+        comes only from bursts and maxes out ~0.3.
     """
     from scipy import stats as sp_stats
 
@@ -337,7 +404,7 @@ def analyse_fill_toxicity(
     as_scores = as_result.as_score
     n = len(prices)
 
-    flagged = as_scores > 0.5
+    flagged = as_scores > as_threshold
     # Only consider trades where price actually moved
     price_changed = np.zeros(n, dtype=bool)
     price_changed[1:] = np.abs(np.diff(prices)) > 0.005
@@ -379,8 +446,11 @@ def analyse_fill_toxicity(
 def sweep_thresholds(
     as_result: ASResult,
     thresholds: Optional[List[float]] = None,
-    half_spread_cents: float = 2.0,
-    mtm_horizon_trades: int = 60,
+    half_spread_cents: float = 1.0,
+    mtm_horizon_trades: Optional[int] = 60,
+    mtm_horizon_minutes: Optional[float] = None,
+    decision_lag_trades: int = 1,
+    include_fees: bool = True,
 ) -> pd.DataFrame:
     """
     Sweep over AS thresholds to find the optimal operating point.
@@ -397,6 +467,9 @@ def sweep_thresholds(
         as_result, strategy="naive",
         half_spread_cents=half_spread_cents,
         mtm_horizon_trades=mtm_horizon_trades,
+        mtm_horizon_minutes=mtm_horizon_minutes,
+        decision_lag_trades=decision_lag_trades,
+        include_fees=include_fees,
     )
     rows.append({
         "threshold": 0.0,
@@ -417,6 +490,9 @@ def sweep_thresholds(
             as_threshold=tau,
             half_spread_cents=half_spread_cents,
             mtm_horizon_trades=mtm_horizon_trades,
+            mtm_horizon_minutes=mtm_horizon_minutes,
+            decision_lag_trades=decision_lag_trades,
+            include_fees=include_fees,
         )
         rows.append({
             "threshold": tau,

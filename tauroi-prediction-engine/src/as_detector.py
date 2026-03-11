@@ -197,6 +197,45 @@ def rolling_em_calibrate(
     return sigma_b_sq_ts, lam_ts, s_j_sq_ts, gamma_ts
 
 
+def rolling_diffusion_only(
+    x_filtered: np.ndarray,
+    dt_seconds: np.ndarray,
+    window: int = 200,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Diffusion-only (Black-Scholes style) calibration: no jump component.
+    All price moves attributed to diffusion; gamma=0, lam=0 everywhere.
+    sigma_b_sq estimated as rolling MLE: sigma^2 = sum(inc^2) / sum(dt).
+    """
+    increments = np.diff(x_filtered)
+    n = len(increments)
+    sigma_b_sq_ts = np.full(n, np.nan)
+    lam_ts = np.zeros(n)
+    s_j_sq_ts = np.full(n, np.nan)
+    gamma_ts = np.zeros(n)
+
+    dt = np.maximum(dt_seconds, 0.1)
+    median_dt = float(np.median(dt))
+    global_var = float(np.var(increments))
+    sigma_sq = max(global_var / median_dt, 1e-8)
+
+    for t in range(n):
+        start = max(0, t - window + 1)
+        win_inc = increments[start:t + 1]
+        win_dt = dt[start:t + 1]
+        if len(win_inc) < 5:
+            sigma_b_sq_ts[t] = sigma_sq
+            s_j_sq_ts[t] = 0.0
+            continue
+        sum_sq = (win_inc ** 2).sum()
+        sum_dt = win_dt.sum()
+        sigma_sq = max(sum_sq / max(sum_dt, 1e-6), 1e-10)
+        sigma_b_sq_ts[t] = sigma_sq
+        s_j_sq_ts[t] = 0.0
+
+    return sigma_b_sq_ts, lam_ts, s_j_sq_ts, gamma_ts
+
+
 def _em_step_hetero(
     increments: np.ndarray,
     dt_seconds: np.ndarray,
@@ -434,6 +473,7 @@ def run_as_detection(
     alpha: float = 0.7,
     gamma_threshold: float = 0.6,
     burst_threshold: float = 3.0,
+    diffusion_only: bool = False,
 ) -> ASResult:
     """
     Full adverse-selection detection pipeline for one ticker.
@@ -461,6 +501,9 @@ def run_as_detection(
         Gamma values above this contribute to AS score.
     burst_threshold : float
         Rate ratio above this triggers burst flag.
+    diffusion_only : bool
+        If True, use diffusion-only (Black-Scholes style) calibration:
+        no jump component, gamma=0 everywhere. For comparison purposes.
     """
     timestamps = pd.to_datetime(df["timestamp"].values)
     prices = df["mid_price"].values.astype(np.float64)
@@ -472,14 +515,19 @@ def run_as_detection(
     dt_seconds = np.diff(ts_epoch).astype(np.float64)
     dt_seconds = np.maximum(dt_seconds, 0.1)
 
-    # --- Signal A: Kalman filter + rolling EM ---
+    # --- Signal A: Kalman filter + rolling calibration ---
     x_filtered = kalman_filter_hf(logits, dt_seconds)
 
-    sigma_b_sq, lam, s_j_sq, gamma_raw = rolling_em_calibrate(
-        x_filtered, dt_seconds,
-        window=em_window,
-        n_em_iter=em_iterations,
-    )
+    if diffusion_only:
+        sigma_b_sq, lam, s_j_sq, gamma_raw = rolling_diffusion_only(
+            x_filtered, dt_seconds, window=em_window,
+        )
+    else:
+        sigma_b_sq, lam, s_j_sq, gamma_raw = rolling_em_calibrate(
+            x_filtered, dt_seconds,
+            window=em_window,
+            n_em_iter=em_iterations,
+        )
 
     # Pad gamma to match trade array length (increments are n-1)
     gamma = np.zeros(n)

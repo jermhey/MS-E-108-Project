@@ -47,10 +47,18 @@ tauroi-prediction-engine/
 │   ├── config.py             # Settings loader (.env)
 │   └── utils.py              # Logging, fee calculations, helpers
 ├── notebooks/
-│   ├── adverse_selection.ipynb   # Full AS analysis: calibration, detection, backtest
+│   ├── adverse_selection.ipynb   # AS analysis: Spotify (KXTOPMONTHLY) markets
+│   ├── weather_backtest.ipynb    # AS analysis: LA temperature (KXHIGHLAX) markets
+│   ├── election_backtest.ipynb   # AS analysis: 2024 presidential/senate markets
+│   ├── sports_backtest.ipynb     # AS analysis: MLB game (KXMLBGAME) markets
 │   └── alpha_proof.ipynb         # Belief-model evaluation & alpha attribution
 ├── cache/
-│   └── kalshi_hf/            # Cached tick-level Kalshi trade data (Parquet)
+│   ├── kalshi_hf/             # Spotify (KXTOPMONTHLY) trade data
+│   ├── kalshi_hf_weather/      # LA temperature (KXHIGHLAX) trade data
+│   ├── kalshi_hf_election/     # 2024 election (PRESPARTY*, SENATE*) trade data
+│   └── kalshi_hf_mlb/          # MLB game (KXMLBGAME) trade data
+├── scripts/
+│   └── fetch_mlb_election.py # Fetch MLB game trade data (run to populate kalshi_hf_mlb)
 ├── tests/
 │   └── test_as_detector.py   # Smoke tests for Kalman, burst detection, E2E
 ├── requirements.txt
@@ -123,6 +131,20 @@ The detection pipeline combines two complementary signals into a composite
 | **Burst flag** | Two-timescale median inter-trade time comparison | Abnormal clustering of trade arrivals |
 
 **Composite score:** `AS = α · γ_t + (1 − α) · burst_ratio`  (default α = 0.7)
+
+### Parameter Choices
+
+| Parameter | Default | Justification |
+|-----------|---------|---------------|
+| **α (alpha)** | 0.7 | Heuristic: jumps (γ) are the primary signal from the paper; bursts are secondary. 70/30 split favors jump detection. No systematic sweep performed. |
+| **gamma_threshold** | 0.6 | Rescales γ into [0,1] for composite; γ < 0.6 contributes 0. Heuristic; could be tuned via validation. |
+| **burst_threshold** | 3.0 | Trades arriving 3× faster than baseline → burst. Common rule of thumb for arrival-rate anomalies. |
+| **burst_short/long_window** | 10 / 500 | Two-timescale median comparison. Short=recent rate, long=baseline. |
+| **em_window** | 200 | Rolling window for EM (in trades). Balances responsiveness vs stability. |
+| **em_iterations** | 8 | EM iterations per window. Typically converges in <10. |
+| **min_jump_logit** | 0.15 | **Not arbitrary.** For 1-cent ticks: 2¢ move ≈ 0.08–0.13 on logit scale. Floor at 0.15 ensures only moves of 3+ cents count as jumps (avoids tick noise). |
+
+The backtest **tau** (AS-score threshold for pulling quotes) is swept in notebooks (0.1–0.9); tau=0.9 is the recommended default for selective pulling.
 
 ### Validation
 
