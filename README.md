@@ -1,4 +1,4 @@
-# Tauroi Prediction Engine
+# Adverse Selection in Prediction Markets
 
 **Adverse-Selection Detection for Kalshi Prediction Markets**
 
@@ -72,8 +72,8 @@ listener counts) and extract adverse-selection signals per trade.
 ### 1. Clone & configure
 
 ```bash
-git clone https://github.com/jermhey/MS-E-108-Project.git
-cd MS-E-108-Project
+git clone https://github.com/jermhey/adverse-selection-in-prediction-markets.git
+cd adverse-selection-in-prediction-markets
 cp .env.example .env
 # Edit .env with your Kalshi API keys
 ```
