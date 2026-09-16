@@ -72,14 +72,21 @@ def load_and_prep(fpath):
     return df
 
 
-def find_golden_example():
+def find_golden_example(market_filter=None):
     """
     Score every is_jump trigger by Step-Function Score = price_after - price_before.
     Returns (df_full, res, center_idx, det_start, det_end, ticker) for #1, and prints top 3.
+    If market_filter is "mlb", "weather", or "election", only candidates from that cache are used.
     """
+    cache_dirs = ["cache/kalshi_hf_weather", "cache/kalshi_hf_mlb", "cache/kalshi_hf_election"]
+    if market_filter:
+        allowed = [f"cache/kalshi_hf_{market_filter}"]
+        cache_dirs = [d for d in cache_dirs if d in allowed]
+        if not cache_dirs:
+            raise ValueError(f"Unknown market_filter: {market_filter}. Use mlb, weather, or election.")
     candidates = []
 
-    for cache_dir in ["cache/kalshi_hf_weather", "cache/kalshi_hf_mlb", "cache/kalshi_hf_election"]:
+    for cache_dir in cache_dirs:
         cache = BASE / cache_dir
         for f in sorted(cache.glob("*_trades.parquet"))[:15]:
             df = load_and_prep(f)
@@ -128,10 +135,15 @@ def find_golden_example():
 def main():
     parser = argparse.ArgumentParser(description="Generate Lie Detector chart (golden toxic-fill example)")
     parser.add_argument("--rank", type=int, default=1, choices=[1, 2, 3], help="Which ranked event to plot (1=best)")
+    parser.add_argument(
+        "--market", choices=["mlb", "weather", "election"], default=None,
+        help="Restrict to one market (e.g. --market mlb for an MLB-game example)",
+    )
     args = parser.parse_args()
 
-    print("Ranking all triggers by Step-Function Score (raw tick prices)...")
-    candidates = find_golden_example()
+    scope = f" (market={args.market})" if args.market else ""
+    print(f"Ranking all triggers by Step-Function Score (raw tick prices){scope}...")
+    candidates = find_golden_example(market_filter=args.market)
     rank_idx = args.rank - 1
     score, df, res, center_idx, det_start, det_end, ticker = candidates[rank_idx]
     print(f"Using #{args.rank}: {ticker} @ idx {center_idx}  score={score:.2f}¢")

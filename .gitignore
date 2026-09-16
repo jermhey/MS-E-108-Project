@@ -1,1 +1,45 @@
-/.DS_Store
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Secrets — never commit credentials or private keys
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Runtime / generated artifacts
+.cache/
+.mplconfig/
+figures/
+state/
+
+# Large fetched Kalshi caches (the small Spotify cache/kalshi_hf is tracked)
+cache/kalshi_hf_election/
+cache/kalshi_hf_mlb/
+cache/kalshi_hf_weather/

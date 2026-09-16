@@ -37,7 +37,7 @@ listener counts) and extract adverse-selection signals per trade.
 ## Repository Structure
 
 ```
-tauroi-prediction-engine/
+.
 ├── src/
 │   ├── as_detector.py        # AS detection: Kalman filter, EM calibration, burst detection
 │   ├── mm_backtest.py        # Market-making backtest & fill-toxicity analysis
@@ -53,10 +53,10 @@ tauroi-prediction-engine/
 │   ├── sports_backtest.ipynb     # AS analysis: MLB game (KXMLBGAME) markets
 │   └── alpha_proof.ipynb         # Belief-model evaluation & alpha attribution
 ├── cache/
-│   ├── kalshi_hf/             # Spotify (KXTOPMONTHLY) trade data
-│   ├── kalshi_hf_weather/      # LA temperature (KXHIGHLAX) trade data
-│   ├── kalshi_hf_election/     # 2024 election (PRESPARTY*, SENATE*) trade data
-│   └── kalshi_hf_mlb/          # MLB game (KXMLBGAME) trade data
+│   ├── kalshi_hf/             # Spotify (KXTOPMONTHLY) trade data — committed
+│   ├── kalshi_hf_weather/      # LA temperature (KXHIGHLAX) — fetched locally
+│   ├── kalshi_hf_election/     # 2024 election — fetched locally
+│   └── kalshi_hf_mlb/          # MLB games — fetched locally
 ├── scripts/
 │   └── fetch_mlb_election.py # Fetch MLB game trade data (run to populate kalshi_hf_mlb)
 ├── tests/
@@ -72,7 +72,8 @@ tauroi-prediction-engine/
 ### 1. Clone & configure
 
 ```bash
-git clone <repo-url> && cd tauroi-prediction-engine
+git clone https://github.com/jermhey/MS-E-108-Project.git
+cd MS-E-108-Project
 cp .env.example .env
 # Edit .env with your Kalshi API keys
 ```
@@ -90,7 +91,7 @@ jupyter notebook notebooks/adverse_selection.ipynb
 ```
 
 The notebook walks through the full pipeline:
-1. Loads cached tick data from `cache/kalshi_hf/`
+1. Loads cached tick data from `cache/kalshi_hf/` (included in the repo). Weather, election, and MLB caches are fetched locally and not committed.
 2. Calibrates the logit jump-diffusion model via rolling EM
 3. Detects adverse-selection events (jump posterior + burst clustering)
 4. Validates with fill-toxicity statistics
